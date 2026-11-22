@@ -190,12 +190,12 @@ def work(job, raw, preset, overrides, fine=False):
 
 
 def _free_gpu():
-    """Give the CUDA cache back after each job (another service shares the GPU; the cache
-    otherwise stays reserved by this process: ~3.6 GiB observed)."""
+    """Release any cached ONNX/GPU memory (worker subprocesses already reclaim all VRAM on exit)."""
     try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        import gc
+        from lumina_vec.feature_routing import clear_session_cache
+        clear_session_cache()
+        gc.collect()
     except Exception:
         pass
 
@@ -443,12 +443,15 @@ def health():
 
 
 def _cuda_name():
-    """GPU name if torch can see one, else None. Cheap: torch is imported once, lazily."""
+    """Hardware GPU name and VRAM summary via DXGI/nvidia-smi without requiring PyTorch."""
     try:
-        import torch
-        return torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-    except Exception:                        # noqa: BLE001 - torch missing is fine (CPU box)
-        return None
+        from lumina_vec.vram_guard import query_gpu_vram_mb
+        name, total_mb, avail_mb = query_gpu_vram_mb()
+        if name:
+            return f'{name} (VRAM {total_mb / 1024:.1f} GB / 可用 {avail_mb / 1024:.1f} GB)'
+    except Exception:                        # noqa: BLE001 - fallback cleanly to CPU info
+        pass
+    return None
 
 
 def main():
@@ -465,11 +468,11 @@ def main():
     print(f'Lumina-IMTVec {__version__}')
     print(f'  url    : http://{a.host}:{a.port}   (LAN: http://<this-ip>:{a.port})')
     print(f'  data   : {ROOT}')
-    print(f'  weights: {WEIGHTS}  ({"found" if WEIGHTS.is_file() else "optional when ONNX present"})')
+    print(f'  weights: {HERE / "weights"}  (ONNX ready={cnn["cnn_ready"]})')
     print(f'  cnn    : ready={cnn["cnn_ready"]} directml={cnn["directml"]} {cnn["cnn_weights"]}')
     print(f'  device : {gpu or ("ONNX DirectML" if cnn["directml"] else "CPU")}')
-    if not WEIGHTS.is_file() and not cnn['cnn_ready']:
-        print('  ! 权重缺失，AI 去颗粒与 CNN 特征路由无法工作。先执行: python scripts/download_weights.py')
+    if not cnn['cnn_ready']:
+        print('  ! ONNX 权重缺失，请确认仓库 weights/ 目录下的 *.onnx 模型文件完整。')
     try:                                     # a real WSGI server if present: the dev server is fine
         from waitress import serve           # for a few users but serialises badly under load
         print('  server : waitress')

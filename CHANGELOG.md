@@ -1,6 +1,22 @@
-# CHANGELOG · Lumina-Vec-Lumina 架构与改动记录
+# CHANGELOG · Lumina-IMTVec 架构与改动记录
 
-记录从 `v10` 单网格基准到 `v24` CNN 热力图双图层重构、再到 `v25` 矢量场 CNN（`LineVectorNet`）直出 Cubic Bezier 线稿与严格线稿约束着色主线的完整演进与实测数据。
+记录从 `v10` 单网格基准到 `v24`/`v25` 矢量场 CNN 重构，再到 **Lumina-IMTVec `v1.0.1`** 纯 ONNX DirectML 免 PyTorch 部署与动态 GPU 显存自适应的完整演进。
+
+---
+
+## [Lumina-IMTVec v1.0.1] · 2026-11-22 · 纯 ONNX 轻量化部署 + 动态 GPU 显存守护
+
+### 核心更新
+- **零 PyTorch 纯 ONNX Runtime 部署**：
+  - `requirements-native.txt` 与 `pyproject.toml` 移除对 PyTorch 的运行依赖，Windows 默认采用 `onnxruntime-directml`（兼容 NVIDIA / AMD / Intel 显卡），跨平台支持 `onnxruntime` CPU 回退；
+  - `scripts/setup_windows.ps1`、`scripts/start.ps1`、`scripts/start_web.bat` 精简为纯 ONNX + 内置 `weights/*.onnx`（7 个模型共 `20.54 MB`）开箱即用安装，不再下载 `.pth` 或强制拉取数 GB PyTorch，且仓库不再随附用户训练脚本；
+  - `webui.py` 与 `lumina_vec/pipeline.py` 移除运行期 `import torch` 硬依赖（旧预设亦无缝降级使用内置 `realesr_anime.onnx`）。
+- **动态 GPU 显存 & 内存自适应守护（`lumina_vec/vram_guard.py`、`lumina_vec/feature_routing.py`）**：
+  - 通过 Windows `dxgi.dll` COM (`IDXGIAdapter3`) 与 `nvidia-smi` + 可用系统内存探测当前运行环境（支持 `LUMINA_VRAM_LIMIT_GB` 与 `LUMINA_FORCE_CPU=1` 手动限额）；
+  - 按显存/内存预算动态调整 `sr_tile`（`384 / 256 / 192 / 128 px`）、`surface_batch`（`32 / 24 / 16 / 8`）、`max_work_px` 与 `max_zoom_px`；
+  - 彻底取消 7 个 ONNX Session 启动时同时常驻显存，支持 `evict_per_stage`（可用显存 `< 7.5 GB` 自动逐阶段释放）及 `_safe_run` 分配溢出自动平滑回退 `CPUExecutionProvider`。
+- **SVG 处理前后对比展示**：
+  - 在 `docs/images/` 新增 `showcase_tarot_full.jpg`、`showcase_tarot_detail.jpg`、`showcase_pop_street.jpg`、`showcase_40mp.jpg` 并嵌入 `README.md`。
 
 ---
 

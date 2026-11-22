@@ -66,6 +66,9 @@
 
 ## 三、 硬件与工程硬约束
 - **GPU 训练显存上限**：任何 ONNX/PyTorch 训练任务必须通过 `_cap_vram(8.5)` 严格控制在 **10 GB 显存以内**。
+- **推理端零 PyTorch 与动态显存/内存守护（2026-11-22 更新）**：
+  - 部署与推理流程彻底脱离 PyTorch，全程由 `onnxruntime-directml` / `onnxruntime` 加载内置 `weights/*.onnx`（7 个模型，20.54 MB）完成；
+  - 新增 [`lumina_vec/vram_guard.py`](file:///D:/Lumina-Vec-Lumina/lumina_vec/vram_guard.py)（基于 Windows DXGI / `nvidia-smi` 与物理可用内存评估）联动 `feature_routing.py`：`sr_tile` 按硬件档位自适应（`384 -> 256 -> 192 -> 128 px`）、常数边缘补齐消除变尺寸张量重构、`< 7.5 GB` 预算开启逐阶段释放 ONNX 会话（`evict_per_stage=True`）、OOM 时 `_safe_run` 自动逐级释放并无缝回退 `CPUExecutionProvider`。
 - **关键回归测试基准**：
   - `test4_stockings`（`7e1858e18f8543f79dfe613ef0c3601c.source`）：丝袜渐变顺滑、高光无破洞、腿部边缘无锯齿毛刺。
   - `tarot`（`3933538b025c49f6993ee1ca799cef1c.source`）：`2x` 与 `5x` 下右眼上方斜向细发丝连续不虚断、白发内浅紫阴影色块保留、小缝隙全部平涂纯色、眼下腮红为单根光滑弧线、少女肤色不过曝不发白（`L` 与原图保持一致）。

@@ -5,11 +5,14 @@ Zero PyTorch dependency at deployment time: loads `weights/surface_style.onnx` a
 to guide quantization, line protection, ink stitching, and stained-glass region merging.
 """
 from dataclasses import dataclass
+import gc
 from pathlib import Path
 import os
 
 import cv2
 import numpy as np
+
+from .vram_guard import compute_runtime_profile
 
 _WEIGHTS_DEFAULT = Path(__file__).resolve().parent.parent / "weights"
 _SESSION_CACHE: dict[str, object] = {}
@@ -34,8 +37,29 @@ class FeatureMaps:
     line_buffer_5: np.ndarray | None = None   # bool [H, W] uniform outer 5% ring reserved as line buffer zone
 
 
-def _get_session(path: Path):
+def release_session(path: Path | str) -> None:
+    """Release a cached ONNX session and trigger GC so DirectML/CUDA frees VRAM immediately."""
     key = str(path)
+    if key in _SESSION_CACHE:
+        _SESSION_CACHE.pop(key, None)
+        gc.collect()
+
+
+def clear_session_cache() -> None:
+    """Evict all cached ONNX sessions and collect garbage to return GPU memory."""
+    if _SESSION_CACHE:
+        _SESSION_CACHE.clear()
+        gc.collect()
+
+
+def _get_session(
+    path: Path,
+    *,
+    force_cpu: bool = False,
+    cuda_mem_limit_bytes: int | None = None,
+    low_vram: bool = False,
+):
+    key = f"{path}|cpu={int(force_cpu)}"
     if key in _SESSION_CACHE:
         return _SESSION_CACHE[key]
     if not path.is_file():
@@ -45,13 +69,49 @@ def _get_session(path: Path):
         so = ort.SessionOptions()
         so.enable_mem_pattern = False
         so.enable_cpu_mem_arena = False
-        avail = ort.get_available_providers()
-        prefs = [p for p in ("DmlExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
-        sess = ort.InferenceSession(str(path), sess_options=so, providers=prefs or ["CPUExecutionProvider"])
+        if low_vram:
+            try:
+                so.add_session_config_entry("session.disable_prepacking", "1")
+            except Exception:
+                pass
+        if force_cpu:
+            providers = ["CPUExecutionProvider"]
+        else:
+            avail = ort.get_available_providers()
+            providers = []
+            if "DmlExecutionProvider" in avail:
+                providers.append("DmlExecutionProvider")
+            if "CUDAExecutionProvider" in avail:
+                if cuda_mem_limit_bytes and cuda_mem_limit_bytes > 0:
+                    providers.append((
+                        "CUDAExecutionProvider",
+                        {"gpu_mem_limit": str(int(cuda_mem_limit_bytes)), "arena_extend_strategy": "kSameAsRequested"},
+                    ))
+                else:
+                    providers.append("CUDAExecutionProvider")
+            providers.append("CPUExecutionProvider")
+        sess = ort.InferenceSession(str(path), sess_options=so, providers=providers)
         _SESSION_CACHE[key] = sess
         return sess
     except Exception:
         return None
+
+
+def _safe_run(sess, feed: dict, sess_path: Path | None = None):
+    """Run ONNX session and gracefully fall back to CPU if GPU/DirectML hits VRAM exhaustion."""
+    try:
+        return sess.run(None, feed), sess
+    except Exception as exc:
+        msg = str(exc).lower()
+        is_mem = any(k in msg for k in ("memory", "alloc", "outofmemory", "887a0005", "dml", "vram", "resource"))
+        if sess_path is None or not is_mem:
+            raise
+        print(f"[vram_guard] GPU memory fallback -> CPU for {sess_path.name}: {str(exc)[:140]}", flush=True)
+        clear_session_cache()
+        cpu_sess = _get_session(sess_path, force_cpu=True)
+        if cpu_sess is None:
+            raise
+        return cpu_sess.run(None, feed), cpu_sess
 
 
 def _run_dense_unet(
@@ -60,6 +120,7 @@ def _run_dense_unet(
     out_ch: int = 4,
     hi_weight: float = 0.72,
     skip_mask: np.ndarray | None = None,
+    sess_path: Path | None = None,
 ) -> tuple[np.ndarray, int, int] | np.ndarray:
     """Run dense UNet using a constant (1, 3, 512, 512) tensor shape so DirectML never
     reallocates dynamic shape arenas or exhausts GPU memory -> [out_ch, H, W].
@@ -73,7 +134,8 @@ def _run_dense_unet(
     if hi_weight < 0.999:
         g_img = cv2.resize(rgb, (tile, tile), interpolation=cv2.INTER_AREA if max(h, w) > tile else cv2.INTER_CUBIC)
         gx = (g_img.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
-        g_out = sess.run(None, {"rgb": gx})[0][0]  # [out_ch, 512, 512]
+        g_res, sess = _safe_run(sess, {"rgb": gx}, sess_path=sess_path)
+        g_out = g_res[0][0]  # [out_ch, 512, 512]
         g_maps = np.stack([cv2.resize(g_out[c], (w, h), interpolation=cv2.INTER_LINEAR) for c in range(out_ch)], axis=0)
         if max(h, w) <= 720 and skip_mask is None:
             return np.clip(g_maps, 0.0, 1.0)
@@ -106,7 +168,8 @@ def _run_dense_unet(
             if sub.shape[0] < tile or sub.shape[1] < tile:
                 sub = cv2.copyMakeBorder(sub, 0, tile - sub.shape[0], 0, tile - sub.shape[1], cv2.BORDER_REFLECT_101)
             tx = (sub.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
-            o = sess.run(None, {"rgb": tx})[0][0]
+            o_res, sess = _safe_run(sess, {"rgb": tx}, sess_path=sess_path)
+            o = o_res[0][0]
             acc[:, y0:y1, x0:x1] += o[:, :th, :tw] * win[:th, :tw]
             w_acc[y0:y1, x0:x1] += win[:th, :tw]
 
@@ -120,8 +183,14 @@ def _run_dense_unet(
     return out
 
 
-def _run_surface_cnn(sess, rgb: np.ndarray, grid: int = 10) -> np.ndarray:
-    """Evaluate 96x96 SurfaceStyleCNN on a regular grid -> upsampled [4, H, W] softmax probs."""
+def _run_surface_cnn(
+    sess,
+    rgb: np.ndarray,
+    grid: int = 10,
+    batch_size: int = 32,
+    sess_path: Path | None = None,
+) -> np.ndarray:
+    """Evaluate 96x96 SurfaceStyleCNN in bounded mini-batches -> upsampled [4, H, W] softmax probs."""
     h, w = rgb.shape[:2]
     ps = 96
     if h < ps or w < ps:
@@ -140,7 +209,13 @@ def _run_surface_cnn(sess, rgb: np.ndarray, grid: int = 10) -> np.ndarray:
     for y0 in ys:
         for x0 in xs:
             patches.append(rgb_w[y0:y0+ps, x0:x0+ps].astype(np.float32).transpose(2, 0, 1) / 255.0)
-    logits = sess.run(None, {"rgb": np.stack(patches, axis=0)})[0]  # [gh*gw, 4]
+    batch = max(1, int(batch_size))
+    out_chunks = []
+    for i in range(0, len(patches), batch):
+        inp = np.stack(patches[i:i + batch], axis=0)
+        res, sess = _safe_run(sess, {"rgb": inp}, sess_path=sess_path)
+        out_chunks.append(res[0])
+    logits = np.concatenate(out_chunks, axis=0)  # [gh*gw, 4]
     logits = logits - logits.max(axis=1, keepdims=True)
     probs = np.exp(logits)
     probs /= probs.sum(axis=1, keepdims=True)
@@ -148,18 +223,31 @@ def _run_surface_cnn(sess, rgb: np.ndarray, grid: int = 10) -> np.ndarray:
     return np.stack([cv2.resize(probs_grid[c], (w, h), interpolation=cv2.INTER_LINEAR) for c in range(4)], axis=0)
 
 
-def _upscale_sr(rgb: np.ndarray, target_scale: float, sess_sr) -> np.ndarray:
-    """Run realesr_anime.onnx (4x tiled) and immediately downsample each tile to target_scale (e.g. 2.0 or 1.5)."""
+def _upscale_sr(
+    rgb: np.ndarray,
+    target_scale: float,
+    sess_sr,
+    *,
+    tile: int = 384,
+    pad: int = 12,
+    sess_path: Path | None = None,
+) -> np.ndarray:
+    """Run realesr_anime.onnx with constant-shape square tiles tuned to GPU VRAM budget."""
     h, w = rgb.shape[:2]
     sh, sw = int(round(h * target_scale)), int(round(w * target_scale))
     out_sr = np.zeros((sh, sw, 3), np.uint8)
-    tile, pad = 448, 12
+    fixed_s = tile + 2 * pad
     for y0 in range(0, h, tile):
         for x0 in range(0, w, tile):
             ya, xa = max(0, y0 - pad), max(0, x0 - pad)
             yb, xb = min(h, y0 + tile + pad), min(w, x0 + tile + pad)
-            patch = rgb[ya:yb, xa:xb].astype(np.float32).transpose(2, 0, 1)[None] / 255.0
-            sr4 = np.clip(sess_sr.run(None, {"rgb": patch})[0][0].transpose(1, 2, 0), 0.0, 1.0)
+            sub = rgb[ya:yb, xa:xb]
+            sub_h, sub_w = sub.shape[:2]
+            if sub_h < fixed_s or sub_w < fixed_s:
+                sub = cv2.copyMakeBorder(sub, 0, fixed_s - sub_h, 0, fixed_s - sub_w, cv2.BORDER_REFLECT_101)
+            patch = sub.astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+            sr_res, sess_sr = _safe_run(sess_sr, {"rgb": patch}, sess_path=sess_path)
+            sr4 = np.clip(sr_res[0][0].transpose(1, 2, 0), 0.0, 1.0)
             ty, tx = (y0 - ya) * 4, (x0 - xa) * 4
             th_raw, tw_raw = min(h, y0 + tile) - y0, min(w, x0 + tile) - x0
             crop4 = (sr4[ty:ty + th_raw * 4, tx:tx + tw_raw * 4] * 255.0).clip(0, 255).astype(np.uint8)
@@ -198,7 +286,7 @@ def _blend_chunked_u8(
     return out
 
 
-def _run_defect_repair_cnn(sess_def, sr_rgb: np.ndarray, parts_1x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _run_defect_repair_cnn(sess_def, sr_rgb: np.ndarray, parts_1x: np.ndarray, sess_path: Path | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Run feature-guided DefectRepairNet (fixed 512x512 DirectML-safe tiled inference) on native-res/SR RGB
     BEFORE line/vector extraction so hazy bright slivers ('亮棱') and trapped scratches are repaired cleanly."""
     hs, ws = sr_rgb.shape[:2]
@@ -231,7 +319,8 @@ def _run_defect_repair_cnn(sess_def, sr_rgb: np.ndarray, parts_1x: np.ndarray) -
                 sub_rgb.astype(np.float32).transpose(2, 0, 1) / 255.0,
                 sub_p.astype(np.float32),
             ], axis=0)[None]
-            out = sess_def.run(None, {"feat_in": ten_7})[0][0]
+            out_res, sess_def = _safe_run(sess_def, {"feat_in": ten_7}, sess_path=sess_path)
+            out = out_res[0][0]
             th, tw = y1 - y0, x1 - x0
             acc[:, y0:y1, x0:x1] += out[:, :th, :tw] * win[:th, :tw]
             w_acc[y0:y1, x0:x1] += win[:th, :tw]
@@ -572,15 +661,24 @@ def infer_feature_maps(
     """Whole-image magnification (default 2x, optional 5x / 10x) -> Pre-flatten closed-region
     Gradient CNN (95% core + 5% line buffer) -> Skip pure-gradient tiles during LineVectorNet."""
     wdir = Path(weights_dir) if weights_dir else Path(os.environ.get("LUMINA_WEIGHTS_DIR", str(_WEIGHTS_DEFAULT)))
-    sess_sr = _get_session(wdir / "realesr_anime.onnx")
-    sess_def = _get_session(wdir / "defect_repair_net.onnx")
-    sess_line = _get_session(wdir / "line_net.onnx")
-    sess_vec = _get_session(wdir / "line_vector_net.onnx")
-    sess_elem = _get_session(wdir / "element_grad.onnx")
-    sess_part = _get_session(wdir / "feature_part.onnx")
-    sess_surf = _get_session(wdir / "surface_style.onnx")
-    if sess_line is None and sess_vec is None and sess_elem is None and sess_part is None and sess_surf is None:
+    p_sr = wdir / "realesr_anime.onnx"
+    p_def = wdir / "defect_repair_net.onnx"
+    p_line = wdir / "line_net.onnx"
+    p_vec = wdir / "line_vector_net.onnx"
+    p_elem = wdir / "element_grad.onnx"
+    p_part = wdir / "feature_part.onnx"
+    p_surf = wdir / "surface_style.onnx"
+    if not any(p.is_file() for p in (p_line, p_vec, p_elem, p_part, p_surf)):
         return None
+
+    profile = compute_runtime_profile()
+    cuda_lim = int(profile.vram_budget_mb * 1024 * 1024) if profile.vram_budget_mb > 0 else None
+    sess_kw = dict(force_cpu=profile.force_cpu, cuda_mem_limit_bytes=cuda_lim, low_vram=profile.evict_per_stage)
+    print(
+        f"[vram_guard] gpu={profile.gpu_name or 'CPU'} vram_budget={profile.vram_budget_mb:.0f}MB "
+        f"ram_avail={profile.ram_avail_mb:.0f}MB sr_tile={profile.sr_tile} evict={profile.evict_per_stage} force_cpu={profile.force_cpu}",
+        flush=True,
+    )
 
     h, w = rgb.shape[:2]
     sr_clean_1x = None
@@ -593,29 +691,41 @@ def infer_feature_maps(
         req_zoom = 2.0
     eff_zoom = req_zoom
 
-    # 1. Pre-analyze 1x semantic/surface priors
-    parts_pre = _run_dense_unet(sess_part, rgb, out_ch=4, hi_weight=0.70) if sess_part is not None else np.zeros((4, h, w), np.float32)
-    surf_pre = _run_surface_cnn(sess_surf, rgb) if sess_surf is not None else np.full((4, h, w), 0.25, np.float32)
+    # 1. Pre-analyze 1x semantic/surface priors (lazy load & optional eviction for low VRAM)
+    sess_part = _get_session(p_part, **sess_kw)
+    parts_pre = _run_dense_unet(sess_part, rgb, out_ch=4, hi_weight=0.70, sess_path=p_part) if sess_part is not None else np.zeros((4, h, w), np.float32)
+    if profile.evict_per_stage and sess_part is not None:
+        release_session(f"{p_part}|cpu={int(profile.force_cpu)}")
 
-    # 2. Whole-image magnification (2x default, or 5x / 10x whole-image upscale)
+    sess_surf = _get_session(p_surf, **sess_kw)
+    surf_pre = _run_surface_cnn(sess_surf, rgb, batch_size=profile.surface_batch, sess_path=p_surf) if sess_surf is not None else np.full((4, h, w), 0.25, np.float32)
+    if profile.evict_per_stage and sess_surf is not None:
+        release_session(f"{p_surf}|cpu={int(profile.force_cpu)}")
+
+    # 2. Whole-image magnification (adaptive dynamic pixel & VRAM cap for low-end PCs)
     zoom_rgb = None
-    if sess_sr is not None and (sess_line is not None or sess_vec is not None or sess_def is not None):
+    if p_sr.is_file() and (p_line.is_file() or p_vec.is_file() or p_def.is_file()):
         rgb_for_sr = _pre_sr_denoise_1x(rgb, parts_pre, surf_pre)
         px_1x = h * w
         if px_1x >= 10_000_000:
-            # Already 4K-8K+ high-res input (e.g. 40 MP): avoid inflating to 160 MP OOM
             work_scale = 1.0
-        elif max(h, w) <= 2400:
+        elif max(h, w) <= 2400 and px_1x * 4 <= profile.max_work_px:
             work_scale = 2.0
         else:
-            work_scale = min(1.5, float(np.sqrt(14_000_000.0 / max(1, px_1x))))
+            work_scale = min(1.5, float(np.sqrt(float(profile.max_work_px) / max(1, px_1x))))
             work_scale = max(1.0, round(work_scale, 2))
-        eff_zoom = req_zoom if (px_1x * req_zoom * req_zoom <= 36_000_000.0) else work_scale
+        eff_zoom = req_zoom if (px_1x * req_zoom * req_zoom <= float(profile.max_zoom_px)) else work_scale
         base_esr_scale = min(4.0, max(work_scale, eff_zoom))
         if base_esr_scale <= 1.05:
             esr_hi = rgb_for_sr
         else:
-            esr_hi = _upscale_sr(rgb_for_sr, base_esr_scale, sess_sr)
+            sess_sr = _get_session(p_sr, **sess_kw)
+            esr_hi = _upscale_sr(
+                rgb_for_sr, base_esr_scale, sess_sr,
+                tile=profile.sr_tile, pad=profile.sr_pad, sess_path=p_sr,
+            ) if sess_sr is not None else cv2.resize(rgb_for_sr, (int(round(w * base_esr_scale)), int(round(h * base_esr_scale))), interpolation=cv2.INTER_CUBIC)
+            if profile.evict_per_stage and sess_sr is not None:
+                release_session(f"{p_sr}|cpu={int(profile.force_cpu)}")
         if eff_zoom > base_esr_scale:
             zh, zw = int(round(h * eff_zoom)), int(round(w * eff_zoom))
             zoom_rgb = cv2.resize(esr_hi, (zw, zh), interpolation=cv2.INTER_LANCZOS4)
@@ -631,14 +741,20 @@ def infer_feature_maps(
 
     # 3. DefectRepairNet BEFORE ElementGradNet so JPEG artifacts are fixed without MeanShift blurring
     defect_prob = None
+    sess_def = _get_session(p_def, **sess_kw)
     if sess_def is not None:
         if sr_hi is not None:
-            sr_hi, defect_prob = _run_defect_repair_cnn(sess_def, sr_hi, parts)
+            sr_hi, defect_prob = _run_defect_repair_cnn(sess_def, sr_hi, parts, sess_path=p_def)
         else:
-            feat_rgb, defect_prob = _run_defect_repair_cnn(sess_def, feat_rgb, parts)
+            feat_rgb, defect_prob = _run_defect_repair_cnn(sess_def, feat_rgb, parts, sess_path=p_def)
+        if profile.evict_per_stage:
+            release_session(f"{p_def}|cpu={int(profile.force_cpu)}")
 
     pre_flat_1x = cv2.resize(sr_hi, (w, h), interpolation=cv2.INTER_AREA) if sr_hi is not None else feat_rgb
-    elem_maps = _run_dense_unet(sess_elem, pre_flat_1x, out_ch=8, hi_weight=0.55) if sess_elem is not None else None
+    sess_elem = _get_session(p_elem, **sess_kw)
+    elem_maps = _run_dense_unet(sess_elem, pre_flat_1x, out_ch=8, hi_weight=0.55, sess_path=p_elem) if sess_elem is not None else None
+    if profile.evict_per_stage and sess_elem is not None:
+        release_session(f"{p_elem}|cpu={int(profile.force_cpu)}")
     if elem_maps is not None:
         grad_core_95, line_buffer_5 = _compute_grad_core_and_buffer(elem_maps, parts_pre)
         # Prevent Gradient-CNN from crossing crisp/soft color-step edges (e.g. borderless eyes/iris)
@@ -677,14 +793,18 @@ def infer_feature_maps(
     # 4. LineVectorNet (skips 512x512 tiles safely enclosed inside 95%-shrunk gradient cores!)
     vec_fields = None
     skipped_vec_tiles, total_vec_tiles = 0, 0
+    sess_vec = _get_session(p_vec, **sess_kw)
     if sess_vec is not None:
         if zoom_rgb is not None and eff_zoom > work_scale:
             wh, ww = sr_hi.shape[:2]
             zh, zw = int(round(h * eff_zoom)), int(round(w * eff_zoom))
             zoom_clean = cv2.resize(sr_hi, (zw, zh), interpolation=cv2.INTER_LANCZOS4)
-            zoom_clean = _reprocess_after_zoom(zoom_clean, sess_def=sess_def, parts_patch=parts)
+            sess_def_zoom = _get_session(p_def, **sess_kw) if p_def.is_file() else None
+            zoom_clean = _reprocess_after_zoom(zoom_clean, sess_def=sess_def_zoom, parts_patch=parts)
+            if profile.evict_per_stage and sess_def_zoom is not None:
+                release_session(f"{p_def}|cpu={int(profile.force_cpu)}")
             skip_zoom = cv2.resize(grad_core_95.astype(np.uint8), (zw, zh), interpolation=cv2.INTER_NEAREST) > 0
-            vf_zoom, skipped_vec_tiles, total_vec_tiles = _run_dense_unet(sess_vec, zoom_clean, out_ch=9, hi_weight=1.0, skip_mask=skip_zoom)
+            vf_zoom, skipped_vec_tiles, total_vec_tiles = _run_dense_unet(sess_vec, zoom_clean, out_ch=9, hi_weight=1.0, skip_mask=skip_zoom, sess_path=p_vec)
             vec_fields = _downsample_zoomed_vf(vf_zoom, wh, ww, zoom_ratio=eff_zoom / work_scale)
             grad_core_hi = cv2.resize(grad_core_95.astype(np.uint8), (ww, wh), interpolation=cv2.INTER_NEAREST) > 0
             vec_fields = _suppress_dense_highlight_plateaus(vec_fields, sr_hi, grad_core_hi=grad_core_hi)
@@ -692,13 +812,16 @@ def infer_feature_maps(
             vec_in = sr_hi if sr_hi is not None else feat_rgb
             vh, vw = vec_in.shape[:2]
             grad_core_hi = cv2.resize(grad_core_95.astype(np.uint8), (vw, vh), interpolation=cv2.INTER_NEAREST) > 0
-            vec_fields, skipped_vec_tiles, total_vec_tiles = _run_dense_unet(sess_vec, vec_in, out_ch=9, hi_weight=1.0, skip_mask=grad_core_hi)
+            vec_fields, skipped_vec_tiles, total_vec_tiles = _run_dense_unet(sess_vec, vec_in, out_ch=9, hi_weight=1.0, skip_mask=grad_core_hi, sess_path=p_vec)
             vec_fields = _suppress_dense_highlight_plateaus(vec_fields, vec_in, grad_core_hi=grad_core_hi)
+        if profile.evict_per_stage:
+            release_session(f"{p_vec}|cpu={int(profile.force_cpu)}")
+    sess_line = _get_session(p_line, **sess_kw)
     if vec_fields is not None:
         if sess_line is not None:
             # Lightweight 1x DedicatedLineNet pass (~0.8s) preserves colored/pastel hair wisps (lm[1])
             # and crisp stained-glass block boundaries (lm[2]) alongside 2x LineVectorNet.
-            line_maps = _run_dense_unet(sess_line, feat_rgb, out_ch=4, hi_weight=0.92)
+            line_maps = _run_dense_unet(sess_line, feat_rgb, out_ch=4, hi_weight=0.92, sess_path=p_line)
         else:
             if work_scale == 2.0 and vec_fields.shape[1] == h * 2 and vec_fields.shape[2] == w * 2:
                 vf0_1x = vec_fields[0].reshape(h, 2, w, 2).max(axis=(1, 3))
@@ -710,16 +833,18 @@ def infer_feature_maps(
             line_maps = np.stack([vf0_1x, vf0_1x * 0.92, vf1_1x, vf0_1x * 0.85], axis=0).astype(np.float32)
     elif sess_line is not None:
         if sr_hi is not None:
-            line_hi = _run_dense_unet(sess_line, sr_hi, out_ch=4, hi_weight=0.95)
+            line_hi = _run_dense_unet(sess_line, sr_hi, out_ch=4, hi_weight=0.95, sess_path=p_line)
             if work_scale == 2.0 and line_hi.shape[1] == h * 2 and line_hi.shape[2] == w * 2:
                 line_maps = line_hi.reshape(4, h, 2, w, 2).max(axis=(2, 4))
             else:
                 k2 = np.ones((2, 2), np.uint8)
                 line_maps = np.stack([cv2.resize(cv2.dilate(line_hi[c], k2), (w, h), interpolation=cv2.INTER_AREA) for c in range(4)], axis=0)
         else:
-            line_maps = _run_dense_unet(sess_line, feat_rgb, out_ch=4, hi_weight=0.92)
+            line_maps = _run_dense_unet(sess_line, feat_rgb, out_ch=4, hi_weight=0.92, sess_path=p_line)
     else:
         line_maps = None
+    if profile.evict_per_stage and sess_line is not None:
+        release_session(f"{p_line}|cpu={int(profile.force_cpu)}")
 
     # Keep calibrated FeaturePartUNet channels [0..3] stable, while exposing dedicated
     # LineNet [4, H, W] and ElementGradNet [8, H, W] for line-locking and gradient topology.
@@ -746,7 +871,9 @@ def infer_feature_maps(
         "line_vec": vec_fields is not None,
         "elem_net": elem_maps is not None,
         "defect_net": defect_prob is not None,
-        "zoom_scale": req_zoom,
+        "zoom_scale": eff_zoom,
+        "vram_budget_mb": profile.vram_budget_mb,
+        "sr_tile": profile.sr_tile,
     }
     if sr_hi is not None and vec_fields is not None:
         sr_hi = _restore_tone_1x(sr_hi, rgb)
@@ -783,7 +910,10 @@ def realesr_dejpeg_onnx(
         clean_full = fmaps.sr_clean_1x
     else:
         wdir = Path(weights_dir) if weights_dir else Path(os.environ.get("LUMINA_WEIGHTS_DIR", str(_WEIGHTS_DEFAULT)))
-        sess = _get_session(wdir / "realesr_anime.onnx")
+        profile = compute_runtime_profile()
+        cuda_lim = int(profile.vram_budget_mb * 1024 * 1024) if profile.vram_budget_mb > 0 else None
+        p_sr = wdir / "realesr_anime.onnx"
+        sess = _get_session(p_sr, force_cpu=profile.force_cpu, cuda_mem_limit_bytes=cuda_lim, low_vram=profile.evict_per_stage)
         if sess is None:
             return None
 
@@ -793,20 +923,9 @@ def realesr_dejpeg_onnx(
         sh = max(64, round(h / pre_down))
         small = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
 
-        # Tiled inference (tile=384, pad=12) to stay low-VRAM across any resolution
-        tile, pad = 448, 12
-        out_sr = np.zeros((sh * 4, sw * 4, 3), np.float32)
-        for y0 in range(0, sh, tile):
-            for x0 in range(0, sw, tile):
-                ya, xa = max(0, y0 - pad), max(0, x0 - pad)
-                yb, xb = min(sh, y0 + tile + pad), min(sw, x0 + tile + pad)
-                patch = small[ya:yb, xa:xb].astype(np.float32).transpose(2, 0, 1)[None] / 255.0
-                sr = sess.run(None, {"rgb": patch})[0][0].transpose(1, 2, 0)
-                ty, tx = (y0 - ya) * 4, (x0 - xa) * 4
-                th, tw = (min(sh, y0 + tile) - y0) * 4, (min(sw, x0 + tile) - x0) * 4
-                out_sr[y0 * 4:y0 * 4 + th, x0 * 4:x0 * 4 + tw] = sr[ty:ty + th, tx:tx + tw]
-
-        clean_u8 = np.rint(np.clip(out_sr, 0.0, 1.0) * 255.0).astype(np.uint8)
+        clean_u8 = _upscale_sr(small, 4.0, sess, tile=profile.sr_tile, pad=profile.sr_pad, sess_path=p_sr)
+        if profile.evict_per_stage:
+            release_session(f"{p_sr}|cpu={int(profile.force_cpu)}")
         clean_full = cv2.resize(clean_u8, (w, h), interpolation=cv2.INTER_AREA)
     if fmaps is None:
         return clean_full
@@ -828,17 +947,27 @@ def repair_image_defects_onnx(
     clean non-defect regions stay bit-exact. Safe no-op returning `(rgb, 0.0)` when weights are absent.
     """
     wdir = Path(weights_dir) if weights_dir else Path(os.environ.get("LUMINA_WEIGHTS_DIR", str(_WEIGHTS_DEFAULT)))
-    sess_def = _get_session(wdir / "defect_repair_net.onnx")
+    profile = compute_runtime_profile()
+    cuda_lim = int(profile.vram_budget_mb * 1024 * 1024) if profile.vram_budget_mb > 0 else None
+    sess_kw = dict(force_cpu=profile.force_cpu, cuda_mem_limit_bytes=cuda_lim, low_vram=profile.evict_per_stage)
+    p_def = wdir / "defect_repair_net.onnx"
+    p_part = wdir / "feature_part.onnx"
+    sess_def = _get_session(p_def, **sess_kw)
     if sess_def is None:
         return rgb, 0.0
-    sess_part = _get_session(wdir / "feature_part.onnx")
+    sess_part = _get_session(p_part, **sess_kw)
     h, w = rgb.shape[:2]
-    parts = _run_dense_unet(sess_part, rgb, out_ch=4, hi_weight=0.70) if sess_part is not None else np.zeros((4, h, w), np.float32)
+    parts = _run_dense_unet(sess_part, rgb, out_ch=4, hi_weight=0.70, sess_path=p_part) if sess_part is not None else np.zeros((4, h, w), np.float32)
+    if profile.evict_per_stage and sess_part is not None:
+        release_session(f"{p_part}|cpu={int(profile.force_cpu)}")
 
-    sr_scale = 2.0 if max(h, w) <= 2400 else 1.5
+    px_1x = h * w
+    sr_scale = 1.0 if px_1x >= 10_000_000 else (2.0 if (max(h, w) <= 2400 and px_1x * 4 <= profile.max_work_px) else 1.5)
     sh, sw = int(round(h * sr_scale)), int(round(w * sr_scale))
-    rgb_hi = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_CUBIC)
-    rep_hi, d_prob_hi = _run_defect_repair_cnn(sess_def, rgb_hi, parts)
+    rgb_hi = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_CUBIC) if (sh, sw) != (h, w) else rgb
+    rep_hi, d_prob_hi = _run_defect_repair_cnn(sess_def, rgb_hi, parts, sess_path=p_def)
+    if profile.evict_per_stage:
+        release_session(f"{p_def}|cpu={int(profile.force_cpu)}")
 
     d_prob = cv2.resize(d_prob_hi, (w, h), interpolation=cv2.INTER_AREA)
     d_prob *= (1.0 - np.clip((parts[2] - 0.32) / 0.25, 0.0, 1.0))

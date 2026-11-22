@@ -21,5 +21,7 @@ data/
 *.part
 *.log
 
-# Large Training Datasets & Checkpoints (>50MB excluded)
-tools/feature_train/work_cache/
+# Training-Only Code & Datasets (Inference ships pre-trained weights/*.onnx cleanly)
+tools/
+lumina_vec/feature_nets.py
+scripts/download_weights.py

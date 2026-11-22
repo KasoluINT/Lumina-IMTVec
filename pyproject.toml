@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lumina-imtvec"
 version = "1.0.0"
-description = "Lumina-IMTVec: illustration to dual-layer planar vector SVG engine for Lumina multi-color layer-stack 3D printing"
+description = "Lumina-IMTVec: illustration to dual-layer planar vector SVG engine for Lumina multi-color layer-stack 3D printing (pure ONNX Runtime, zero PyTorch)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,8 @@ dependencies = [
     "scikit-image<0.27",
     "scipy",
     "vtracer==1.0.0a3",
+    "onnxruntime-directml; sys_platform == 'win32'",
+    "onnxruntime; sys_platform != 'win32'",
     "flask",
     "waitress",
     "shapely>=2.0,<3",

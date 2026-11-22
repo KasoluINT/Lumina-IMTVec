@@ -178,9 +178,21 @@ def vectorize(img: Image.Image, weights=None, pre_down=2.0, work_scale=1.5, ms_s
     if clean is not None:   # AI step already done elsewhere (python -m lumina_vec.denoise)
         work = clean.convert("RGB").resize((round(W * work_scale), round(H * work_scale)), Image.LANCZOS)
     elif ai:
-        from .denoise import ai_clean
-        work = ai_clean(img, weights, pre_down=pre_down, out_scale=work_scale,
-                        progress=lambda f: report("ai", f, f"{f * 100:.0f}%"))
+        if os.path.isfile(weights):
+            try:
+                from .denoise import ai_clean
+                work = ai_clean(img, weights, pre_down=pre_down, out_scale=work_scale,
+                                progress=lambda f: report("ai", f, f"{f * 100:.0f}%"))
+            except ImportError:
+                work = None
+        else:
+            work = None
+        if work is None:
+            from .feature_routing import realesr_dejpeg_onnx
+            src_np = np.asarray(img.convert("RGB"))
+            cleaned = realesr_dejpeg_onnx(src_np, weights_dir=weights_dir, pre_down=pre_down)
+            base_im = Image.fromarray(cleaned) if cleaned is not None else img.convert("RGB")
+            work = base_im.resize((round(W * work_scale), round(H * work_scale)), Image.LANCZOS)
     else:
         work = img.convert("RGB").resize((round(W * work_scale), round(H * work_scale)), Image.LANCZOS)
     rgb = np.asarray(work.convert("RGB"))

@@ -38,7 +38,29 @@
 
 ---
 
-## 三、 技术架构与五段式流水线
+## 三、 效果对比（SVG 处理前后）
+
+> 所有结果均为真实插画经 **Lumina-IMTVec** 纯 ONNX 推理管线导出双层 SVG 后，经无头 Chromium 真实矢量光栅化与原画对比（点击可查看大图）：
+
+### 1. 复杂彩窗二次元插画 · 整体结构还原（`tarot`）
+![Tarot Full Comparison](docs/images/showcase_tarot_full.jpg)
+
+### 2. 细节放大对比 · 5× 纤细发丝、睫毛与高光层次（`tarot`）
+![Tarot Detail Comparison](docs/images/showcase_tarot_detail.jpg)
+- **左图（原图光栅）**：高倍率放大后可见锯齿边缘、JPG 涂抹糊边与半透明渐变杂色。
+- **右图（Lumina-IMTVec SVG）**：连续不断裂的贝塞尔矢量细发丝、干净收敛的渐变色阶与 100% 互不重叠的单色封闭色块，可直接导入 **Lumina 叠色打印软件** 按色分层切片。
+
+### 3. 复杂流行插画 · 无描边硬软边缘协同分割（`e9630244`）
+![Pop Street Comparison](docs/images/showcase_pop_street.jpg)
+- 霓虹高对比阴影、服饰碎片图案及无黑框柔和肤/眼界均被精准锁定在独立封闭色域内。
+
+### 4. 40MP 超高清大图（`4904 × 8192`）· 分块守护免爆内存（`4322ad13`）
+![40MP Illustration Comparison](docs/images/showcase_40mp.jpg)
+- 配合 `vram_guard.py` 动态显存限额与分块混色护栏，百兆像素级插画可在有限显存下稳健完成矢量分色输出。
+
+---
+
+## 四、 技术架构与五段式流水线
 
 完整技术规范永久留档于 [ARCHITECTURE_SPEC.md](ARCHITECTURE_SPEC.md)，核心执行顺序如下：
 
@@ -60,13 +82,12 @@
 
 ---
 
-## 四、 端到端实测验证
+## 五、 端到端实测验证
 
 基于真实图生矢量并通过 Edge 无头 Chromium 光栅化对比原图实测（2026-11-22）：
 
 | 测试样本 | 输入分辨率 | 缩放档位 | 闭合区域数（与 `gap-filler` 一一对应） | SVG 体积 | 渲染 `2x->1x` PSNR / 关键表现 |
 | --- | --- | --- | --- | --- | --- |
-| `test4_stockings` | `1080 × 1603` | `2x` | **6,646**（`2,247` 线条 + `4,399` 填充） | `6.04 MB` | **26.32 dB**（Preview `26.67 dB`，`dE=2.92`），丝袜渐变顺滑封闭 |
 | `tarot` | `1333 × 1769` | `2x` | **11,289**（`4,154` 线条 + `7,135` 填充） | `11.08 MB` | 较旧碎化管线 `147,964` 路径缩减 **~13×**，`edgeF1 = 0.9462`，肤色零过曝 |
 | `tarot` | `1333 × 1769` | `5x` | **10,436**（`3,267` 线条 + `7,169` 填充） | `11.88 MB` | **24.30 dB**（Preview `25.88 dB`，`edgeF1 = 0.9503`），5x 斜向细发丝连续无虚断 |
 | `e9630244` | `928 × 1312` | `2x` | **14,155**（`3,434` 线条 + `10,721` 填充） | `12.50 MB` | 无框眼白 `[202, 197, 234]` 与原图 `[203, 197, 235]` 一致，下眼缘平直微弧精准还原 |
@@ -74,14 +95,38 @@
 
 ---
 
-## 五、 快速启动与部署
+## 六、 快速启动与部署（纯 ONNX，免安装 PyTorch / 免用户训练）
 
-### 1. Web UI 一键启动（推荐）
+本项目已将全部特征识别与超分模型固化为轻量化 ONNX 权重并随仓库内置（`weights/*.onnx`，总计仅约 **20.54 MB**）。**普通用户无需安装数 GB 的 PyTorch / CUDA Toolkit，也无需自行训练或额外下载模型权重。**
+
+### 1. 环境初始化（Windows 推荐 DirectML 通用 GPU 加速）
+
+```powershell
+# 自动创建 .venv 并安装纯 ONNX DirectML 运行环境（兼容 NVIDIA / AMD / Intel 显卡）
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
+
+# 如需强制纯 CPU 部署（无独显或核显显存极小机器）
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1 -CpuOnly
+```
+
+安装依赖亦支持 `pip install -r requirements-native.txt` 或以标准 Python 包安装：`pip install -e .`（见 [pyproject.toml](pyproject.toml)）。
+
+### 2. 动态 GPU 显存自适应守护（`lumina_vec/vram_guard.py`）
+
+为防止低显存显卡（如 `2 GB / 4 GB / 6 GB`）或小内存电脑在处理高清大图时出现显存溢出或 OOM 崩溃，推理引擎会在运行前通过 Windows DXGI / `nvidia-smi` 与可用系统内存自动计算安全运行档位：
+- **分档动态缩放**：自动下调超分平铺尺寸 `sr_tile`（`384 -> 256 -> 192 -> 128 px`）、表面特征推理批大小 `surface_batch`（`32 -> 24 -> 16 -> 8`）与最大工作像素上限；
+- **按阶段及时释放显存**：在显存紧张设备（`< 7.5 GB` 可用预算）上自动开启逐阶段卸载 ONNX Session，绝不同时常驻 7 个模型；
+- **无感 CPU 回退**：当 DirectML / CUDA 抛出分配失败或显存不足异常时，自动释放显存会话并无缝切换 `CPUExecutionProvider` 完成当前阶段；
+- **手动微调环境变量**（可选）：
+  - `LUMINA_VRAM_LIMIT_GB=2.5`：显式限制 GPU 可用显存预算（单位 GB）；
+  - `LUMINA_FORCE_CPU=1`：强制全程使用 CPU 推理。
+
+### 3. Web UI 一键启动（推荐）
 
 默认端口 `8091`，浏览器访问 <http://127.0.0.1:8091>：
 
 ```powershell
-# PowerShell 启动（自动定位 .venv、权重与 data 目录）
+# PowerShell 启动（自动定位 .venv、ONNX 权重与 data 目录）
 powershell -ExecutionPolicy Bypass -File scripts\start.ps1
 
 # 或批处理启动（支持自定义端口）
@@ -90,16 +135,7 @@ scripts\start_web.bat --port 8091
 
 在 Web 界面选择默认预设 **「双层矢量（`print-regions`）」**，转换完成后可在预览栏切换 **「双层 / 仅线稿 / 仅着色」** 检查结构，直接下载 `.svg` 导入 **Lumina 叠色打印软件**。
 
-### 2. 从零安装环境（Windows）
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1            # 默认 CUDA 12.6
-powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1 -Cuda cpu # 无独显 CPU / DirectML 模式
-```
-
-安装依赖亦支持 `pip install -r requirements-native.txt` 或以标准 Python 包安装：`pip install -e .`（见 [pyproject.toml](pyproject.toml)）。
-
-### 3. 命令行调用（CLI）
+### 4. 命令行调用（CLI）
 
 ```powershell
 # 主线推荐：面向叠色打印的平面双层矢量（CNN 特征路由 + 纯净色阶 + SVG 边界平滑）
@@ -114,21 +150,21 @@ python -m lumina_vec.pipeline ink.png ink.svg --structure print-regions --no-ai
 
 ---
 
-## 六、 目录结构
+## 七、 目录结构
 
 ```text
 Lumina-IMTVec\
 ├─ webui.py, index.html               WebUI 服务与前端交互界面（Flask + Waitress + 独立 Worker 子进程）
 ├─ pyproject.toml                     Python 工程与打包元数据（lumina-imtvec 1.0.0）
-├─ requirements-native.txt            原生运行依赖清单
-├─ README.md                          项目说明与技术概览
+├─ requirements-native.txt            纯 ONNX 原生运行依赖清单（零 PyTorch）
+├─ README.md                          项目说明、效果展示与部署指南
 ├─ ARCHITECTURE_SPEC.md               核心架构规范与回归基准永久留档
 ├─ CHANGELOG.md                       版本演进日志
 ├─ lumina_vec\                        核心图像处理与矢量引擎包
 │   ├─ planar_partition.py            无损平面双层分区主引擎（Stage 2 -> 2.5 -> 3 -> 4）
 │   ├─ print_partition.py             vectorize_print 主入口与 SVG 矢量追踪集成
-│   ├─ feature_routing.py             ONNX 多模型协同推理、40MP 分块混合防 OOM 与渐变核防越界保护
-│   ├─ feature_nets.py                CNN 网络结构定义（LineVectorNet 9ch / ElementGradNet / DefectRepairNet 等）
+│   ├─ feature_routing.py             ONNX 多模型协同推理、40MP 分块混合防 OOM 与 OOM 回退机制
+│   ├─ vram_guard.py                  零 PyTorch 硬件探测与动态显存/内存自适应守护
 │   ├─ gradient_topology.py           梯度拓扑与单弧线腮红 MBO 平滑算法
 │   ├─ shared_regions.py              共享边界拓扑图构建与分段曲线追踪器（trace_regions）
 │   ├─ structural_curves.py           共边结构曲线、转角平滑与圆弧/贝塞尔拟合
@@ -137,8 +173,7 @@ Lumina-IMTVec\
 │   ├─ two_layer_engine.py            repair_line_heatmap 共线脊线补断与旧双图层引擎
 │   ├─ pipeline.py / presets.py       CLI 入口与预设路由
 │   └─ worker.py                      WebUI 独立转换子进程入口（免服务重启即时热生效）
-├─ weights\                           内置 ONNX 推理权重（realesr_anime / line_vector_net / line_net / element_grad / feature_part / surface_style / defect_repair_net）
-├─ tools\feature_train\               CNN 模型训练与 ONNX 导出脚本
-├─ scripts\                           Windows 启动、环境初始化与 PSNR 对比验证工具
-└─ docs\                              历史设计分析与参考文档
+├─ weights\                           内置纯 ONNX 推理权重（realesr_anime / line_vector_net / line_net / element_grad / feature_part / surface_style / defect_repair_net）
+├─ scripts\                           Windows 纯 ONNX 一键部署与启动工具
+└─ docs\                              效果对比图（docs/images/）与设计分析文档
 ```
