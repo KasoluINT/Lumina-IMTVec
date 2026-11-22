@@ -1,0 +1,25 @@
+# Python & Virtual Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Secrets & Environment
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Runtime User Data & Packaging / Scratch
+data/
+*.part
+*.log
+
+# Large Training Datasets & Checkpoints (>50MB excluded)
+tools/feature_train/work_cache/

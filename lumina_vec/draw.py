@@ -1,0 +1,1069 @@
+"""Line pipeline v5 (prototype): DRAW the line-model map with Bezier strokes, one at a time.
+
+Like an artist inking over a sketch: find the strongest line not yet drawn, put the pen on it,
+follow it in one movement (direction changes limited, so it goes straight through crossings,
+short faint gaps are bridged), fit the path with as few cubic Beziers as possible, measure its
+width, then erase what the stroke covers from the sketch and repeat.
+
+Eyes: iris / pupil are ellipses, highlights white dots placed LAST, on top of the lines - the way
+they are painted - so a highlight no longer cuts the eye's outline."""
+import numpy as np
+import cv2
+from scipy import ndimage as ndi
+
+from .contour import fit_cubic, ink_field, _fit_one, _reparam, _max_err, _chord_params, _bezier_d1, _bezier_d2
+
+DIRS = np.stack([np.cos(np.linspace(0, np.pi, 36, endpoint=False)),
+                 np.sin(np.linspace(0, np.pi, 36, endpoint=False))], 1)
+
+
+def _sample(R, pts):
+    return ndi.map_coordinates(R, [pts[..., 1], pts[..., 0]], order=1, mode="constant", cval=0.0)
+
+
+def _rot(v, a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+
+
+def _follow(R, P, p, d, thr=0.22, step=1.0, max_turn=np.radians(22), gap=8, overlap=10, max_len=3000):
+    """Walk along a line from p in direction d. Steering uses the full sketch P (so a crossing
+    already drawn by another stroke does not stop the pen), continuation needs P >= thr
+    (lower than the start threshold), gaps up to `gap` px are bridged, and the walk stops once
+    it has run `overlap` px along a line that is already drawn (residual R empty)."""
+    out = []
+    angs = np.radians(np.arange(-22, 23, 5.5))
+    misses = 0; drawn = 0
+    pend = []
+    for _ in range(max_len):
+        best, bd = -1, d
+        for a in angs:
+            nd = _rot(d, a)
+            look = p + np.outer(np.arange(1, 4), nd) * step
+            v = (0.5 * _sample(P, look) + 0.5 * _sample(R, look)).mean() * (1 - 0.15 * abs(a) / max_turn)
+            if v > best:
+                best, bd = v, nd
+        q = p + bd * step
+        nrm = np.array([-bd[1], bd[0]])
+        offs = np.array([-1.5, -1, -0.5, 0, 0.5, 1, 1.5])
+        vals = _sample(P, q + np.outer(offs, nrm))
+        if vals.max() > 0:
+            q = q + nrm * offs[int(vals.argmax())] * 0.6
+        vp = _sample(P, q[None])[0]; vr = _sample(R, q[None])[0]
+        if vp >= thr:
+            out.extend(pend); pend = []; misses = 0
+            out.append(q)
+            drawn = drawn + 1 if vr < 0.1 else 0
+            if drawn > overlap:
+                out = out[:-overlap]
+                break
+        else:
+            misses += 1
+            pend.append(q)
+            if misses > gap:
+                break
+        d = _unit(0.7 * d + 0.3 * (q - p)) if np.linalg.norm(q - p) > 0 else d
+        p = q
+    return out
+
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else v
+
+
+def _no_inflection(ctrl, rel=0.05):
+    """True if the cubic bends one way only (C shape, no S)."""
+    t = np.linspace(0.02, 0.98, 25)
+    d1, d2 = _bezier_d1(ctrl, t), _bezier_d2(ctrl, t)
+    k = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    big = np.abs(k) > rel * np.abs(k).max() if np.abs(k).max() > 0 else np.zeros_like(k, bool)
+    return not (np.any(k[big] > 0) and np.any(k[big] < 0))
+
+
+def _minor_bulge(pts):
+    """Size (px) of the smaller of the two bulges either side of the chord: ~0 for a straight
+    line or a C, large only for a real S."""
+    a, b = pts[0], pts[-1]; ch = b - a; cl = np.hypot(*ch)
+    if cl < 1e-6:
+        return 0.0
+    sd = ((pts[:, 0] - a[0]) * ch[1] - (pts[:, 1] - a[1]) * ch[0]) / cl
+    return float(min(sd.max(), -sd.min(), ) if sd.max() > 0 and sd.min() < 0 else 0.0)
+
+
+def _fit_free(pts, u):
+    """One cubic, ends fixed, both handles free (least squares)."""
+    b0, b1, b2, b3 = _bern(u)
+    M = np.hstack([b1, b2])
+    sol = np.linalg.lstsq(M, pts - b0 * pts[0] - b3 * pts[-1], rcond=None)[0]
+    return np.array([pts[0], sol[0], sol[1], pts[-1]])
+
+
+def simple_pieces(pts, tol_min=1.5, tol_rel=0.06, tol_max=4.0, min_len=4.0, depth=0, s_len=50.0, s_px=1.0):
+    """Split a hand path into pieces that are each ONE straight line or ONE C-shaped cubic
+    (no S-bends, no wiggles). A piece that does not fit is cut at its worst point, and both
+    halves become separate strokes. Returns list of (ctrl 4x2, i0, i1) index ranges into pts."""
+    n = len(pts)
+    L = np.hypot(*np.diff(pts, axis=0).T).sum()
+    tol = float(np.clip(tol_rel * L, tol_min, tol_max))
+    a, b = pts[0], pts[-1]
+    ch = b - a; cl = np.hypot(*ch)
+    if cl > 1e-6:
+        dline = np.abs((pts[:, 0] - a[0]) * ch[1] - (pts[:, 1] - a[1]) * ch[0]) / cl
+    else:
+        dline = np.hypot(*(pts - a).T)
+    if dline.max() <= 0.8 * tol or n < 4 or L < min_len * 1.5 or depth > 8:
+        return [(np.array([a, a + ch / 3, b - ch / 3, b]), 0, n - 1)]
+    u = _chord_params(pts)
+    ctrl = _fit_free(pts, u)
+    for _ in range(4):
+        u = _reparam(pts, ctrl, u); ctrl = _fit_free(pts, u)
+    err, at = _max_err(pts, ctrl, u)
+    # one cubic: straight / C always; an S only if it is tiny (< s_px, i.e. jitter) or the stroke
+    # is long (hair strands are S-shaped); short strokes never visibly wiggle
+    if err <= tol and (L >= s_len or _minor_bulge(pts) < s_px):
+        return [(ctrl, 0, n - 1)]
+    # cut at the worst point (or at the line's farthest point if the curve had an S)
+    if err > tol:
+        cut = at
+    else:                                   # an S: cut where the path crosses its chord
+        ch = pts[-1] - pts[0]; cl = max(np.hypot(*ch), 1e-6)
+        sd = ((pts[:, 0] - pts[0][0]) * ch[1] - (pts[:, 1] - pts[0][1]) * ch[0]) / cl
+        zc = np.flatnonzero(np.diff(np.sign(sd[1:-1]))) + 1
+        cut = int(zc[np.argmin(np.abs(zc - n // 2))]) if len(zc) else int(np.abs(sd).argmax())
+    cut = int(np.clip(cut, 2, n - 3))
+    left = simple_pieces(pts[:cut + 1], tol_min, tol_rel, tol_max, min_len, depth + 1, s_len, s_px)
+    right = simple_pieces(pts[cut:], tol_min, tol_rel, tol_max, min_len, depth + 1, s_len, s_px)
+    return left + [(c, i0 + cut, i1 + cut) for c, i0, i1 in right]
+
+
+def _turn_corners(pts, ang_deg=35.0, k=4):
+    """Indices where the path really turns (angle between the directions k samples before and
+    after > ang_deg), local maxima only."""
+    n = len(pts)
+    if n < 2 * k + 3:
+        return []
+    a = pts[k:-k] - pts[:-2 * k]; b = pts[2 * k:] - pts[k:-k]
+    cs = (a * b).sum(1) / np.maximum(np.hypot(*a.T) * np.hypot(*b.T), 1e-9)
+    ang = np.degrees(np.arccos(np.clip(cs, -1, 1)))
+    idx = []
+    for i in np.flatnonzero(ang > ang_deg):
+        if ang[i] >= ang[max(i - 1, 0)] and ang[i] >= ang[min(i + 1, len(ang) - 1)]:
+            j = i + k
+            if not idx or j - idx[-1] > 2 * k:
+                idx.append(j)
+    return idx
+
+
+def _resample1(pts, step=1.0):
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
+    if d[-1] < 2 * step:
+        return pts
+    s = np.arange(0, d[-1] + 1e-6, step)
+    return np.c_[np.interp(s, d, pts[:, 0]), np.interp(s, d, pts[:, 1])]
+
+
+def _resample_stroke(pts, step=1.0):
+    """Uniform samples including both endpoints, even after repeated merges."""
+    length = np.r_[0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+    s = np.linspace(0, length[-1], max(2, int(round(length[-1] / step)) + 1))
+    return np.stack([np.interp(s, length, dim) for dim in pts.T], axis=1)
+
+
+def adaptive_pieces(pts, spacing_px, s_len=40.0):
+    """Cut only at real turns; then each run is one cubic (C, or a gentle S when long) fitted with
+    a tolerance that follows the local line spacing: loose in open areas, tight where lines
+    are dense (there a loose curve would wander onto the neighbouring strand)."""
+    cuts = [0] + _turn_corners(pts, ang_deg=40.0, k=5) + [len(pts) - 1]   # pts at 1 px steps
+    out = []
+    for i0, i1 in zip(cuts[:-1], cuts[1:]):
+        if i1 - i0 < 1:
+            continue
+        run = pts[i0:i1 + 1]
+        L = np.hypot(*np.diff(run, axis=0).T).sum()
+        tmax = float(np.clip(0.3 * spacing_px, 1.2, 4.0))
+        for c, a, b in simple_pieces(run, tol_min=1.2, tol_rel=0.06, tol_max=tmax, s_len=s_len):
+            out.append((c, a + i0, b + i0))
+    return out
+
+
+def _width_at(Pm, pts, tang, maxw=8.0):
+    """Width of the sketch line across each point: length of the >0.5 run along the normal."""
+    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+    offs = np.arange(-maxw / 2, maxw / 2 + 1e-6, 0.25)
+    sp = pts[:, None, :] + nrm[:, None, :] * offs[None, :, None]
+    v = _sample(Pm, sp) > 0.5
+    c = len(offs) // 2
+    w = np.zeros(len(pts))
+    for i in range(len(pts)):
+        if not v[i, c]:
+            w[i] = 0.0; continue
+        l = c
+        while l > 0 and v[i, l - 1]:
+            l -= 1
+        r = c
+        while r < len(offs) - 1 and v[i, r + 1]:
+            r += 1
+        w[i] = (r - l + 1) * 0.25
+    return w
+
+
+def bez_point(seg, t):
+    t = np.asarray(t)[:, None]
+    return ((1 - t) ** 3) * seg[0] + 3 * ((1 - t) ** 2) * t * seg[1] + 3 * (1 - t) * t * t * seg[2] + t ** 3 * seg[3]
+
+
+def _join_paths(paths, dist=8.0, cos_min=0.8):
+    """Join paths whose ends nearly meet and point at each other (one line drawn in pieces)."""
+    from scipy.spatial import cKDTree
+    def odir(pts, e):                      # outward direction at end e
+        k = min(6, len(pts) - 1)
+        return _unit(pts[0] - pts[k]) if e == 0 else _unit(pts[-1] - pts[-1 - k])
+    changed = True
+    while changed and len(paths) > 1:
+        changed = False
+        ends = [(i, e) for i in range(len(paths)) for e in (0, 1)]
+        P = np.array([paths[i][0 if e == 0 else -1] for i, e in ends])
+        pairs = sorted(cKDTree(P).query_pairs(dist), key=lambda ab: np.linalg.norm(P[ab[0]] - P[ab[1]]))
+        used = set()
+        for a, b in pairs:
+            (i, ei), (j, ej) = ends[a], ends[b]
+            if i == j or i in used or j in used:
+                continue
+            di, dj = odir(paths[i], ei), odir(paths[j], ej)
+            gap = P[b] - P[a]; gl = np.linalg.norm(gap)
+            if np.dot(di, dj) > -cos_min:
+                continue
+            if gl > 1e-6 and (np.dot(di, gap / gl) < cos_min * 0.9 or np.dot(dj, -gap / gl) < cos_min * 0.9):
+                continue
+            pi = paths[i] if ei == 1 else paths[i][::-1]
+            pj = paths[j] if ej == 0 else paths[j][::-1]
+            paths[i] = np.vstack([pi, pj]); paths[j] = None
+            used |= {i, j}; changed = True
+        paths = [p for p in paths if p is not None]
+    return paths
+
+
+def draw_strokes(P, cov, thr=0.5, min_len=3.0, max_strokes=8000, wscale=1.0, wmin=0.8, width_from=None):
+    """P: line probability (0..1), cov: original's ink coverage. Returns list of strokes:
+    dict(segs=[4x2 cubic], w=(n,) widths, pts=(n,2) samples, free=[start,end])."""
+    R = P.astype(np.float32).copy()
+    H, W = R.shape
+    Rs = cv2.GaussianBlur(R, (0, 0), 1.0)
+    paths = []
+    for _ in range(max_strokes):
+        y, x = np.unravel_index(np.argmax(Rs), Rs.shape)
+        if Rs[y, x] < thr:
+            break
+        p = np.array([float(x), float(y)])
+        t = np.arange(-6, 7)
+        scores = [_sample(R, p + np.outer(t, d)).sum() for d in DIRS]
+        d = DIRS[int(np.argmax(scores))]
+        fwd = _follow(R, P, p, d); bwd = _follow(R, P, p, -d)
+        pts = np.array(bwd[::-1] + [p] + fwd)
+        L = np.hypot(*np.diff(pts, axis=0).T).sum() if len(pts) > 1 else 0
+        if L < min_len:
+            cv2.circle(R, (int(x), int(y)), 2, 0, -1); cv2.circle(Rs, (int(x), int(y)), 3, 0, -1)
+            continue
+        paths.append(pts)
+        tang = np.gradient(pts, axis=0); tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+        w = np.maximum(_width_at(P, pts, tang), 1.0)
+        m = np.zeros((H, W), np.uint8)
+        cv2.fillPoly(m, [np.round(outline(pts, w + 1.5, tang, [False, False]) * 16).astype(np.int32)], 1,
+                     lineType=cv2.LINE_8, shift=4)
+        R[m > 0] = 0
+        Rs = np.where(cv2.dilate(m, np.ones((5, 5), np.uint8)) > 0, cv2.GaussianBlur(R, (0, 0), 1.0), Rs)
+    paths = _join_paths(paths)
+    strokes = []
+    for pts in paths:
+        pts = ndi.gaussian_filter1d(pts, 3.0, axis=0, mode="nearest")
+        pieces = simple_pieces(pts)
+        for pi, (ctrl, i0, i1) in enumerate(pieces):
+            seglen = np.hypot(*np.diff(pts[i0:i1 + 1], axis=0).T).sum() if i1 > i0 else 0
+            sm = bez_point(ctrl, np.linspace(0, 1, max(4, int(seglen * 2))))
+            tang = np.gradient(sm, axis=0); tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+            w = _width_at(P, sm, tang)
+            if width_from is not None:
+                ink = _width_at(width_from, sm, tang)
+                w = np.where(ink > 0, np.minimum(np.where(w > 0, w, ink), np.maximum(ink, wmin)), w)
+            w = ndi.gaussian_filter1d(np.maximum(w, wmin) * wscale, 3, mode="nearest")
+            strokes.append(dict(segs=[ctrl], pts=sm, w=w, free=[pi == 0, pi == len(pieces) - 1], path=len(strokes)))
+    return strokes
+
+
+def outline(pts, w, tang, taper=(True, True), taper_px=6.0):
+    s = np.r_[0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
+    L = s[-1]; w = w.copy()
+    tp = min(taper_px, L / 3)
+    if tp > 0:
+        if taper[0]:
+            w *= np.clip(0.2 + 0.8 * s / tp, 0, 1)
+        if taper[1]:
+            w *= np.clip(0.2 + 0.8 * (L - s) / tp, 0, 1)
+    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+    left = pts + nrm * (w / 2)[:, None]; right = pts - nrm * (w / 2)[:, None]
+    def cap(c, tt, ww, free):
+        if free:
+            return (c + tt * ww * 0.6)[None]
+        nn = np.array([-tt[1], tt[0]]); a = np.linspace(0, np.pi, 7)[1:-1]
+        return c + (np.cos(a)[:, None] * nn[None] + np.sin(a)[:, None] * tt[None]) * ww / 2
+    return np.vstack([left, cap(pts[-1], tang[-1], w[-1], taper[1]), right[::-1],
+                      cap(pts[0], -tang[0], w[0], taper[0])])
+
+
+# ------------------------------------------------------------------------- eyes
+
+def find_eyes(rgb, line_mask, min_r=6, max_r=80):
+    """Irises: saturated, roughly round blobs (highlight holes filled) that sit next to line art.
+    Returns list of dict(iris=ellipse, pupil=ellipse|None, highlights=[ellipse], colors)."""
+    from .color import srgb_to_oklab
+    lab = srgb_to_oklab(rgb).astype(np.float32)
+    C = np.hypot(lab[..., 1], lab[..., 2]); L = lab[..., 0]
+    sat = (C > 0.08) & (L > 0.25) & (L < 0.9)
+    sat = cv2.morphologyEx(sat.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    near_line = cv2.dilate(line_mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    n, cc, st, _ = cv2.connectedComponentsWithStats(sat, connectivity=8)
+    eyes = []
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if a < np.pi * min_r ** 2 * 0.5 or max(w, h) > 2 * max_r or w < 2 * min_r or h < 2 * min_r:
+            continue
+        m = cc == i
+        m = ndi.binary_fill_holes(m)
+        cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        c = max(cs, key=len)
+        if len(c) < 10:
+            continue
+        el = cv2.fitEllipse(c)
+        (cx, cy), (ew, eh), ang = el
+        ell_area = np.pi * ew * eh / 4
+        fill = m.sum() / max(ell_area, 1)
+        if not (0.75 < fill < 1.25) or max(ew, eh) / max(min(ew, eh), 1) > 2.2:
+            continue
+        if not near_line[m].mean() > 0.3:
+            continue
+        # an iris has a highlight (near-white dot) and a darker centre / pupil
+        em0 = np.zeros(m.shape, np.uint8); cv2.ellipse(em0, el, 1, -1)
+        g0 = cv2.dilate(em0, np.ones((5, 5), np.uint8)) > 0
+        if not ((g0 & (L > 0.9) & (C < 0.06)).sum() >= 2):
+            continue
+        em = np.zeros(m.shape, np.uint8); cv2.ellipse(em, el, 1, -1); em = em > 0
+        pix = rgb[em & ~(L > 0.9)]
+        iris_col = np.median(pix, 0) if len(pix) else rgb[int(cy), int(cx)]
+        # lower half of the iris is usually lighter (reflected light): a second, lower ellipse
+        low = em & (np.arange(m.shape[0])[:, None] > cy + 0.15 * eh / 2)
+        low_col = np.median(rgb[low & ~(L > 0.9)], 0) if (low & ~(L > 0.9)).sum() > 10 else None
+        # pupil: darkest compact part inside
+        inner = em & (L < np.percentile(L[em], 20))
+        inner = cv2.morphologyEx(inner.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+        pupil = None
+        if inner.sum() > 8:
+            pc, _ = cv2.findContours(inner.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            pc = max(pc, key=cv2.contourArea)
+            if len(pc) >= 5:
+                pe = cv2.fitEllipse(pc)
+                pupil = (pe, np.median(rgb[inner], 0))
+        # highlights: small near-white blobs inside the (slightly grown) iris
+        grow = cv2.dilate(em.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        hl = grow & (L > 0.9) & (C < 0.06)
+        hn, hc, hs, _ = cv2.connectedComponentsWithStats(hl.astype(np.uint8), connectivity=8)
+        hls = []
+        for k in range(1, hn):
+            if 2 <= hs[k, 4] <= 0.25 * ell_area:
+                hx, hy, hw, hh, _ = hs[k]
+                pk = np.argwhere(hc == k)[:, ::-1].astype(np.float32)
+                if len(pk) >= 5:
+                    he = cv2.fitEllipse(pk)
+                else:
+                    (ccx, ccy), r = cv2.minEnclosingCircle(pk)
+                    he = ((ccx, ccy), (2 * r + 1, 2 * r + 1), 0)
+                hls.append(he)
+        eyes.append(dict(iris=el, iris_col=iris_col, low_col=low_col, pupil=pupil, highlights=hls, mask=em))
+    return eyes
+
+
+def ellipse_path(el, col, k=8):
+    """Exact ellipse as 4 cubic Beziers."""
+    (cx, cy), (w, h), ang = el
+    a, b = w / 2, h / 2; th = np.radians(ang)
+    kk = 0.5522847498
+    pts = [(1, 0), (1, kk), (kk, 1), (0, 1), (-kk, 1), (-1, kk), (-1, 0), (-1, -kk), (-kk, -1), (0, -1), (kk, -1), (1, -kk)]
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    P = [R @ np.array([px * a, py * b]) + [cx, cy] for px, py in pts]
+    d = "M%.2f,%.2f" % tuple(P[0])
+    for i in range(4):
+        c1, c2, e = P[3 * i + 1], P[3 * i + 2], P[(3 * i + 3) % 12]
+        d += "C%.2f,%.2f %.2f,%.2f %.2f,%.2f" % (*c1, *c2, *e)
+    return '<path d="%sZ" fill="#%02x%02x%02x"/>' % (d, *(int(v) for v in col))
+
+
+def eye_paths(eyes):
+    """(under-lines paths, over-lines paths): iris, lower iris, pupil under; highlights over."""
+    under, over = [], []
+    for e in eyes:
+        under.append(ellipse_path(e["iris"], e["iris_col"]))
+        if e["low_col"] is not None:
+            (cx, cy), (w, h), ang = e["iris"]
+            under.append(ellipse_path(((cx, cy + h * 0.18), (w * 0.8, h * 0.55), ang), e["low_col"]))
+        if e["pupil"] is not None:
+            under.append(ellipse_path(*e["pupil"]))
+        for hl in e["highlights"]:
+            over.append(ellipse_path(hl, (255, 255, 255)))
+    return under, over
+
+
+def stroke_svg(strokes, rgb, tol=0.4):
+    from .contour import fit_closed
+    H, W = rgb.shape[:2]
+    lum = rgb.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    out = []
+    for st in strokes:
+        pts, w = st["pts"], st["w"]
+        tang = np.gradient(pts, axis=0); tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+        poly = outline(pts, w, tang, st.get("free", [True, True]))
+        segs = fit_closed(np.vstack([poly, poly[:1]]), tol=tol, corner_deg=75)
+        if not segs:
+            continue
+        xi = np.clip(pts[:, 0].astype(int), 0, W - 1); yi = np.clip(pts[:, 1].astype(int), 0, H - 1)
+        px = rgb[yi, xi].astype(float); l = lum[yi, xi]
+        col = px[l <= np.median(l)].mean(0)
+        d = "M%.2f,%.2f" % tuple(segs[0][0]) + "".join("C%.2f,%.2f %.2f,%.2f %.2f,%.2f" % (*s[1], *s[2], *s[3]) for s in segs)
+        out.append('<path d="%sZ" fill="#%02x%02x%02x"/>' % (d, *(int(v) for v in col)))
+    return out
+
+
+# ------------------------------------------------- lens output: a line = TWO cubic Beziers
+
+def _bern(t):
+    t = t[:, None]; mt = 1 - t
+    return mt ** 3, 3 * mt * mt * t, 3 * mt * t * t, t ** 3
+
+
+def _edge_cubic(E, t, a, b):
+    """One cubic with fixed ends a, b that best fits edge points E(t) (least squares)."""
+    b0, b1, b2, b3 = _bern(t)
+    rhs = E - b0 * a - b3 * b
+    M = np.hstack([b1, b2])                        # (n,2) basis for P1, P2
+    G = M.T @ M + 1e-6 * np.eye(2)
+    sol = np.linalg.solve(G, M.T @ rhs)            # (2,2): rows P1, P2
+    return np.array([a, sol[0], sol[1], b])
+
+
+def lens_paths(strokes, rgb, wmin=0.8):
+    """Each stroke -> closed path of exactly two cubics (left edge, right edge), sharing the tips
+    at free ends; at joined ends the edges stay apart by the line width (short straight cap)."""
+    H, W = rgb.shape[:2]
+    lum = rgb.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    out = []
+    for st in strokes:
+        C = st["segs"][0]
+        n = len(st["pts"]); t = np.linspace(0, 1, n)
+        pts = bez_point(C, t)
+        d1 = _bezier_d1(C, t); d1 /= np.maximum(np.hypot(*d1.T), 1e-9)[:, None]
+        nrm = np.stack([-d1[:, 1], d1[:, 0]], 1)
+        w = np.maximum(st["w"], wmin)
+        f0, f1 = st.get("free", [True, True])
+        hw0 = 0.0 if f0 else w[0] / 2
+        hw1 = 0.0 if f1 else w[-1] / 2
+        # target half-width: measured, pinned to the end widths (0 at a free tip)
+        half = w / 2
+        half = half.copy(); half[0], half[-1] = hw0, hw1
+        Lp = _edge_cubic(pts + nrm * half[:, None], t, pts[0] + nrm[0] * hw0, pts[-1] + nrm[-1] * hw1)
+        Rp = _edge_cubic(pts - nrm * half[:, None], t, pts[0] - nrm[0] * hw0, pts[-1] - nrm[-1] * hw1)
+        xi = np.clip(pts[:, 0].astype(int), 0, W - 1); yi = np.clip(pts[:, 1].astype(int), 0, H - 1)
+        px = rgb[yi, xi].astype(float); l = lum[yi, xi]
+        col = px[l <= np.median(l)].mean(0)
+        f = lambda p: "%.2f,%.2f" % tuple(p)
+        d = (f"M{f(Lp[0])}C{f(Lp[1])} {f(Lp[2])} {f(Lp[3])}"
+             + ("" if f1 else f"L{f(Rp[3])}")
+             + f"C{f(Rp[2])} {f(Rp[1])} {f(Rp[0])}Z")
+        out.append('<path d="%s" fill="#%02x%02x%02x"/>' % (d, *(int(v) for v in col)))
+    return out
+
+
+def strokes_from_graph(P, cov=None, wmin=0.8, adaptive=True, merge=True):
+    """Line FINDING from the centreline graph (strokes2.build_strokes: complete, pieces paired
+    through crossings, gaps bridged) + simple pieces (line / C, gentle S on long) per stroke,
+    in the same format as draw_strokes (for lens_paths)."""
+    from .strokes2 import build_strokes, line_spacing
+    out = []
+    S = line_spacing(P) if adaptive else None
+    for st in build_strokes(P, spacing=S):
+        pts = st["xy"]
+        if len(pts) < 3:
+            continue
+        pts = _resample1(pts)
+        pts = ndi.gaussian_filter1d(pts, 1.5, axis=0, mode="nearest")
+        if adaptive:
+            yi = np.clip(pts[:, 1].astype(int), 0, S.shape[0] - 1); xi = np.clip(pts[:, 0].astype(int), 0, S.shape[1] - 1)
+            pieces = adaptive_pieces(pts, float(np.median(S[yi, xi])))
+        else:
+            pieces = simple_pieces(pts)
+        for pi, (ctrl, i0, i1) in enumerate(pieces):
+            seglen = np.hypot(*np.diff(pts[i0:i1 + 1], axis=0).T).sum() if i1 > i0 else 0
+            sm = bez_point(ctrl, np.linspace(0, 1, max(4, int(seglen * 2))))
+            tang = np.gradient(sm, axis=0); tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+            w = _width_at(P, sm, tang)
+            if cov is not None:
+                ink = _width_at(cov, sm, tang)
+                w = np.where(ink > 0, np.minimum(np.where(w > 0, w, ink), np.maximum(ink, wmin)), w)
+            w = ndi.gaussian_filter1d(np.maximum(w, wmin), 3, mode="nearest")
+            free = [st["free"][0] if pi == 0 else False, st["free"][1] if pi == len(pieces) - 1 else False]
+            out.append(dict(segs=[ctrl], pts=sm, w=w, free=free))
+    if merge:
+        out = merge_pieces(out, P, cov, S)
+    return out
+
+
+def lens_layer_legacy(geo, M, A):
+    """Line layer v5 (kept for rollback / A/B): centreline-graph strokes, each PIECE drawn as its
+    own two-cubic lens - a long line therefore comes out as one path per piece."""
+    from .strokes2 import line_prob, blob_mask
+    from .contour import field_paths
+    P = line_prob(M, A)
+    cov = ink_field(geo, P > 0.5)
+    blob = blob_mask(P, cov)
+    Pd = np.where(blob, 0, P)
+    st = strokes_from_graph(Pd, cov)
+    H, W = P.shape
+    cover = blob.astype(np.uint8).copy()
+    for s in st:
+        tang = np.gradient(s["pts"], axis=0); tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+        poly = outline(s["pts"], s["w"], tang, s.get("free", [True, True]))
+        cv2.fillPoly(cover, [np.round(poly * 16).astype(np.int32)], 1, lineType=cv2.LINE_8, shift=4)
+    out = []
+    lum = geo.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    n, cc = cv2.connectedComponents(blob.astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        m = cc == i
+        l = lum[m]; col = geo[m][l <= np.median(l)].mean(0)
+        tag = field_paths(np.where(m, np.maximum(cov, 0.6 * Pd), 0).astype(np.float32), m, col, ss=2, tol=0.4, min_area=4)
+        if tag:
+            out.append(tag)
+    # dots: small dark marks the model sees as line art but too short to be a stroke (beauty
+    # marks, pupils' dots, freckles) - drawn as small filled shapes so they are not lost
+    mask = (P > 0.5) & (cov > 0.4) & ~(cover > 0)
+    n, cc, stt, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        x, y, w_, h_, a = stt[i]
+        if a < 4 or a > 150 or max(w_, h_) > 3.5 * max(1, min(w_, h_)):
+            continue
+        m = cc == i
+        l = lum[m]; col = geo[m][l <= np.median(l)].mean(0)
+        tag = field_paths(np.where(m, np.maximum(cov, 0.6 * P), 0).astype(np.float32), m, col, ss=2, tol=0.3, min_area=2)
+        if tag:
+            out.append(tag); cover[m] = 1
+    out += lens_paths(st, geo)
+    return out, cover > 0
+
+
+def _fit_one_piece(pts, tol, s_len=40.0, s_px=1.5):
+    """One cubic over pts if it fits within tol (C always, S only if tiny or long); else None."""
+    if len(pts) < 4:
+        return None
+    L = np.hypot(*np.diff(pts, axis=0).T).sum()
+    u = _chord_params(pts)
+    c = _fit_free(pts, u)
+    for _ in range(4):
+        u = _reparam(pts, c, u); c = _fit_free(pts, u)
+    err, _ = _max_err(pts, c, u)
+    if err <= tol and (L >= s_len or _minor_bulge(pts) < s_px):
+        return c
+    return None
+
+
+def merge_pieces(strokes, P, cov=None, spacing=None, gap_max=16.0, cos_min=0.85, wmin=0.8):
+    """Several short pieces that together lie on one straight line / C curve (gentle S when long)
+    are replaced by that ONE curve. Candidate pairs: ends within an adaptive gap (0.7 x local
+    line spacing, 3..gap_max px), pointing at each other; accepted only if a single cubic fits
+    all their points within an adaptive tolerance. Greedy, closest pairs first, repeated."""
+    from scipy.spatial import cKDTree
+    items = [dict(pts=s["pts"], free=list(s.get("free", [True, True]))) for s in strokes]
+
+    def sp_at(q):
+        if spacing is None:
+            return 10.0
+        return float(spacing[int(np.clip(q[1], 0, spacing.shape[0] - 1)), int(np.clip(q[0], 0, spacing.shape[1] - 1))])
+
+    def odir(p, e):
+        k = min(4, len(p) - 1)
+        return _unit(p[0] - p[k]) if e == 0 else _unit(p[-1] - p[-1 - k])
+    changed = True
+    rounds = 0
+    while changed and rounds < 6:
+        changed = False; rounds += 1
+        ends = [(i, e) for i, it in enumerate(items) if it is not None and len(it["pts"]) >= 2 for e in (0, 1)]
+        if len(ends) < 2:
+            break
+        E = np.array([items[i]["pts"][0 if e == 0 else -1] for i, e in ends])
+        pairs = sorted(cKDTree(E).query_pairs(gap_max), key=lambda ab: np.linalg.norm(E[ab[0]] - E[ab[1]]))
+        used = set()
+        for a, b in pairs:
+            (i, ei), (j, ej) = ends[a], ends[b]
+            if i == j or i in used or j in used or items[i] is None or items[j] is None:
+                continue
+            gap = E[b] - E[a]; gl = np.linalg.norm(gap)
+            sp = sp_at((E[a] + E[b]) / 2)
+            # the direction + single-curve checks below are strict, so the gap may be generous;
+            # a long gap still needs faint line evidence underneath
+            if gl > float(np.clip(1.2 * sp, 4.0, gap_max)):
+                continue
+            if gl > 6.0:
+                k = np.linspace(0, 1, 9)[1:-1, None]
+                q = E[a] + gap * k
+                if ndi.map_coordinates(P, [q[:, 1], q[:, 0]], order=1).mean() < 0.1:
+                    continue
+            di, dj = odir(items[i]["pts"], ei), odir(items[j]["pts"], ej)
+            if np.dot(di, dj) > -cos_min:
+                continue
+            if gl > 1.0 and (np.dot(di, gap / gl) < cos_min * 0.8 or np.dot(dj, -gap / gl) < cos_min * 0.8):
+                continue
+            pi = items[i]["pts"] if ei == 1 else items[i]["pts"][::-1]
+            pj = items[j]["pts"] if ej == 0 else items[j]["pts"][::-1]
+            pts = _resample1(np.vstack([pi, pj]))
+            L = np.hypot(*np.diff(pts, axis=0).T).sum()
+            tol = float(np.clip(0.04 * L, 1.0, np.clip(0.3 * sp, 1.2, 3.0)))
+            c = _fit_one_piece(pts, tol)
+            if c is None:
+                continue
+            fi = items[i]["free"][0] if ei == 1 else items[i]["free"][1]
+            fj = items[j]["free"][1] if ej == 0 else items[j]["free"][0]
+            items[i] = dict(pts=bez_point(c, np.linspace(0, 1, max(4, int(L * 2)))), free=[fi, fj], ctrl=c)
+            items[j] = None
+            used |= {i, j}; changed = True
+    out = []
+    keep = {id(s["pts"]): s for s in strokes}
+    for it in items:
+        if it is None:
+            continue
+        if "ctrl" not in it and id(it["pts"]) in keep:
+            out.append(keep[id(it["pts"])]); continue
+        sm = it["pts"]
+        tang = np.gradient(sm, axis=0); tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+        w = _width_at(P, sm, tang)
+        if cov is not None:
+            ink = _width_at(cov, sm, tang)
+            w = np.where(ink > 0, np.minimum(np.where(w > 0, w, ink), np.maximum(ink, wmin)), w)
+        w = ndi.gaussian_filter1d(np.maximum(w, wmin), 3, mode="nearest")
+        out.append(dict(segs=[it["ctrl"]], pts=sm, w=w, free=it["free"]))
+    return out
+
+
+# ------------------------------------------------- v6: one line = ONE continuous path
+
+def _out_dir(p, e, k=5):
+    """Outward unit direction at end e (0 = start, 1 = end) of a stroke polyline."""
+    k = min(k, len(p) - 1)
+    if k <= 0:
+        return np.zeros(2)
+    return _unit(p[0] - p[k]) if e == 0 else _unit(p[-1] - p[-1 - k])
+
+
+def _half_circle(c, u, v, r):
+    """Two cubics from c + v*r to c - v*r, bulging toward +u (a round cap)."""
+    K = 0.5522847498
+    a = c + v * r
+    m = c + u * r
+    b = c - v * r
+    return [(a, a + u * K * r, m + v * K * r, m), (m, m - v * K * r, b + u * K * r, b)]
+
+
+def _edge_chain(edge, cuts, tol, allow_two_points=False):
+    """Fit a polyline edge as cubics, one run per cut interval (a run stays C1 inside).
+
+    contour.fit_cubic splits at the worst point and rebuilds both sides with the SAME chord
+    tangent, so joints inside a run are smooth by construction; runs only break at the
+    stroke's real corners."""
+    segs = []
+    for a0, b0 in zip(cuts[:-1], cuts[1:]):
+        if b0 - a0 < (1 if allow_two_points else 2):
+            continue
+        run = edge[a0:b0 + 1]
+        t1 = _unit(run[min(2, len(run) - 1)] - run[0])
+        t2 = _unit(run[max(-3, -len(run))] - run[-1])
+        segs += fit_cubic(run, t1, t2, tol)
+    return segs
+
+
+def stroke_outline_d(pts, w, free=(True, True), tol=0.45, corner_deg=40.0, allow_two_points=False):
+    """Closed d of a whole stroke: left edge forward, round cap, right edge backward.
+    Tips taper to a point (w ~ 0 at a free end), so the shape closes without a cap there."""
+    n = len(pts)
+    if n < 2:
+        return ""
+    tang = np.gradient(pts, axis=0)
+    tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+    half = np.maximum(np.asarray(w, float), 0.0) / 2
+    Lf = pts + nrm * half[:, None]
+    Rt = pts - nrm * half[:, None]
+    cuts = [0] + [int(c) for c in _turn_corners(pts, corner_deg, 5) if 1 < c < n - 2] + [n - 1]
+    cuts = sorted(set(cuts))
+    d = ["M%.2f,%.2f" % tuple(Lf[0])]
+    for s in _edge_chain(Lf, cuts, tol, allow_two_points):
+        d.append("C%.2f,%.2f %.2f,%.2f %.2f,%.2f" % (*s[1], *s[2], *s[3]))
+    if not free[1] and half[-1] > 0.05:
+        for s in _half_circle(pts[-1], tang[-1], nrm[-1], half[-1]):
+            d.append("C%.2f,%.2f %.2f,%.2f %.2f,%.2f" % (*s[1], *s[2], *s[3]))
+    for s in _edge_chain(Rt[::-1], [n - 1 - c for c in cuts[::-1]], tol, allow_two_points):
+        d.append("C%.2f,%.2f %.2f,%.2f %.2f,%.2f" % (*s[1], *s[2], *s[3]))
+    if not free[0] and half[0] > 0.05:
+        for s in _half_circle(pts[0], -tang[0], -nrm[0], half[0]):
+            d.append("C%.2f,%.2f %.2f,%.2f %.2f,%.2f" % (*s[1], *s[2], *s[3]))
+    d.append("Z")
+    return "".join(d)
+
+
+def width_profile(pts, P, cov=None, wmin=0.8, smooth_px=3.0, taper_px=6.0, free=(True, True)):
+    """Width along the WHOLE stroke (one measurement, one smoothing pass), tapering to a point at
+    free ends. Measuring per piece left a step in the width at every piece boundary."""
+    tang = np.gradient(pts, axis=0)
+    tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+    w = _width_at(P, pts, tang)
+    if cov is not None:
+        ink = _width_at(cov, pts, tang)
+        w = np.where(ink > 0, np.minimum(np.where(w > 0, w, ink), np.maximum(ink, wmin)), w)
+    w = ndi.gaussian_filter1d(np.maximum(w, wmin), smooth_px, mode="nearest")
+    s = np.r_[0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
+    L = s[-1]
+    tp = min(taper_px, L / 3) if L > 0 else 0.0
+    if tp > 0:
+        if free[0]:
+            w = w * np.clip(0.92 * s / tp, 0, 1) ** 0.7
+        if free[1]:
+            w = w * np.clip(0.92 * (L - s) / tp, 0, 1) ** 0.7
+    return w
+
+
+def bridge_strokes(items, P, spacing=None, bridge_px=4.0, bridge_max=18.0, cos_min=0.85,
+                   weak=0.10, rounds=6):
+    """Join strokes whose free ends nearly meet and point at each other. This is what turns a
+    hair strand the model broke into 3-5 pieces back into ONE line: the pieces become one stroke,
+    so they end up as one path with one width profile and one colour."""
+    from scipy.spatial import cKDTree
+    items = [dict(pts=np.asarray(it["pts"], float), free=[bool(it["free"][0]), bool(it["free"][1])])
+             for it in items]
+    for _ in range(rounds):
+        live = [(i, e) for i, it in enumerate(items) if it is not None for e in (0, 1)]
+        if len(live) < 2:
+            break
+        E = np.array([items[i]["pts"][0 if e == 0 else -1] for i, e in live])
+        pairs = sorted(cKDTree(E).query_pairs(bridge_max),
+                       key=lambda ab: np.linalg.norm(E[ab[0]] - E[ab[1]]))
+        used = set()
+        changed = False
+        for a, b in pairs:
+            (i, ei), (j, ej) = live[a], live[b]
+            if i == j or i in used or j in used or items[i] is None or items[j] is None:
+                continue
+            gap = E[b] - E[a]
+            gl = float(np.linalg.norm(gap))
+            mid = (E[a] + E[b]) / 2
+            sp = 10.0
+            if spacing is not None:
+                sp = float(spacing[int(np.clip(mid[1], 0, spacing.shape[0] - 1)),
+                                   int(np.clip(mid[0], 0, spacing.shape[1] - 1))])
+            if gl > float(np.clip(sp, bridge_px, bridge_max)):
+                continue
+            di = _out_dir(items[i]["pts"], ei)
+            dj = _out_dir(items[j]["pts"], ej)
+            if np.dot(di, dj) > -cos_min:                 # not a continuation
+                continue
+            if gl > 1e-6:
+                u = gap / gl
+                if np.dot(di, u) < cos_min * 0.9 or np.dot(dj, -u) < cos_min * 0.9:
+                    continue
+            if gl > 2.0:                                  # a long bridge needs faint line evidence
+                k = np.linspace(0, 1, max(3, int(gl) + 1))[1:-1, None]
+                q = E[a] + gap * k
+                if ndi.map_coordinates(P, [q[:, 1], q[:, 0]], order=1).mean() < weak:
+                    continue
+            pi = items[i]["pts"] if ei == 1 else items[i]["pts"][::-1]
+            pj = items[j]["pts"] if ej == 0 else items[j]["pts"][::-1]
+            fi = items[i]["free"][0] if ei == 1 else items[i]["free"][1]
+            fj = items[j]["free"][1] if ej == 0 else items[j]["free"][0]
+            items[i] = dict(pts=_resample1(np.vstack([pi, pj]), 1.0), free=[fi, fj])
+            items[j] = None
+            used |= {i, j}
+            changed = True
+        if not changed:
+            break
+    return [it for it in items if it is not None]
+
+
+def hysteresis(P, strong=0.5, weak=0.30, boost=0.62):
+    """Keep faint line pixels (weak < P < strong) only where they hang off a strong line. The
+    models fade out in places (light-grey outlines, hair tips); a hard 0.5 cut splits the line
+    there, while a plain lower threshold would add loose specks all over the picture."""
+    P = np.asarray(P, np.float32)
+    s = P > strong
+    if not s.any():
+        return P
+    w = (P > weak) & ~s
+    if not w.any():
+        return P
+    near = cv2.dilate(s.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    n, cc = cv2.connectedComponents(w.astype(np.uint8), connectivity=8)
+    touch = np.bincount(cc[near & w], minlength=n) > 0
+    touch[0] = False
+    keep = touch[cc] & w
+    out = P.copy()
+    out[keep] = np.maximum(out[keep], boost)
+    return out
+
+
+def line_strokes(P, cov=None, wmin=0.8, spacing=None, blob=None, support=None, continuity=False):
+    """Whole-line strokes from the probability map: one item per line (crossings paired, gaps
+    bridged), each with its own width profile."""
+    from .strokes2 import build_strokes, line_spacing
+    S = line_spacing(P) if spacing is None else spacing
+    items = []
+    for st in build_strokes(P, spacing=S, blob=blob, continuity=continuity):
+        pts = st["xy"]
+        if len(pts) < 3:
+            continue
+        xy = _resample_stroke(pts) if continuity else _resample1(pts, 1.0)
+        pts = ndi.gaussian_filter1d(xy, 1.5, axis=0, mode="nearest")
+        if continuity:
+            pts[0], pts[-1] = xy[0], xy[-1]
+        items.append(dict(pts=pts, free=[bool(st["free"][0]), bool(st["free"][1])]))
+    if continuity:
+        items = merge_continuations(items, P if support is None else support, spacing=S)
+    else:
+        items = merge_strokes(bridge_strokes(items, P, S), P)
+    # leftover stubs (a few points, no length) cannot be drawn as a line - they used to become
+    # slivers that looked like fragments next to the real strand
+    items = [it for it in items
+             if float(np.hypot(*np.diff(it["pts"], axis=0).T).sum()) >= 2.0]
+    for it in items:
+        it["w"] = width_profile(it["pts"], P, cov, wmin=wmin, free=it["free"])
+    return items
+
+
+def stroke_paths(items, rgb, wmin=0.8, tol=0.45, continuity=False):
+    """One path per stroke, one colour per stroke (darker half of the original on its centreline)."""
+    H, W = rgb.shape[:2]
+    lum = rgb.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    out = []
+    for it in items:
+        pts = it["pts"]
+        w = it["w"] if continuity else np.maximum(it["w"], wmin)
+        d = stroke_outline_d(pts, w, it["free"], tol=tol, allow_two_points=continuity)
+        if not d:
+            continue
+        xi = np.clip(pts[:, 0].astype(int), 0, W - 1)
+        yi = np.clip(pts[:, 1].astype(int), 0, H - 1)
+        px = rgb[yi, xi].astype(float)
+        l = lum[yi, xi]
+        col = px[l <= np.median(l)].mean(0) if len(px) else np.array([0, 0, 0])
+        out.append('<path d="%s" fill="#%02x%02x%02x"/>' % (d, *(int(v) for v in col)))
+    return out
+
+
+def lens_layer(geo, M, A, debug=False, hyst_weak=0.30, tol=0.45, continuity=False):
+    """Line layer v6: every line is ONE closed path (left edge + round cap + right edge, chained
+    cubic Beziers), with one width profile and one colour per line. Thick dark masses (lash
+    roots, eyeliner) stay filled shapes. Returns (svg paths, cover mask [, debug stats])."""
+    from .strokes2 import line_prob, blob_mask
+    from .contour import field_paths
+    P = line_prob(M, A)
+    cov = ink_field(geo, P > 0.5)
+    blob = blob_mask(P, cov, keep_linear=continuity)
+    Pd = np.where(blob, 0, P)
+    if hyst_weak:
+        Pd = hysteresis(Pd, weak=hyst_weak)
+    items = (line_strokes(Pd, cov, blob=blob, support=np.where(blob, 0, np.maximum(P, cov)), continuity=True)
+             if continuity else line_strokes(Pd, cov))
+    H, W = P.shape
+    cover = blob.astype(np.uint8).copy()
+    for it in items:
+        tang = np.gradient(it["pts"], axis=0)
+        tang /= np.maximum(np.hypot(*tang.T), 1e-9)[:, None]
+        if continuity:
+            nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+            half = it["w"] / 2
+            left = it["pts"] + nrm * half[:, None]
+            right = it["pts"] - nrm * half[:, None]
+            caps = [np.empty((0, 2)), np.empty((0, 2))]
+            for i, e, sign in ((0, 0, -1), (1, -1, 1)):
+                if not it["free"][i] and half[e] > 0.05:
+                    a = np.linspace(0, np.pi, 7)[1:-1]
+                    caps[i] = it["pts"][e] + sign * half[e] * (
+                        np.cos(a)[:, None] * nrm[e] + np.sin(a)[:, None] * tang[e])
+            poly = np.vstack([left, caps[1], right[::-1], caps[0]])
+        else:
+            poly = outline(it["pts"], np.maximum(it["w"], 1.0), tang, [False, False])
+        cv2.fillPoly(cover, [np.round(poly * 16).astype(np.int32)], 1, lineType=cv2.LINE_8, shift=4)
+    out = []
+    lum = geo.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    n, cc = cv2.connectedComponents(blob.astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        m = cc == i
+        l = lum[m]; col = geo[m][l <= np.median(l)].mean(0)
+        tag = field_paths(np.where(m, np.maximum(cov, 0.6 * Pd), 0).astype(np.float32), m, col, ss=2, tol=0.4, min_area=4)
+        if tag:
+            out.append(tag)
+    # dots: small dark marks too short to be a stroke (beauty marks, glints) - filled dots
+    mask = (P > 0.5) & (cov > 0.4) & ~(cover > 0)
+    n, cc, stt, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        x, y, w_, h_, a = stt[i]
+        if a < 4 or a > 150 or max(w_, h_) > 3.5 * max(1, min(w_, h_)):
+            continue
+        m = cc == i
+        l = lum[m]; col = geo[m][l <= np.median(l)].mean(0)
+        tag = field_paths(np.where(m, np.maximum(cov, 0.6 * P), 0).astype(np.float32), m, col, ss=2, tol=0.3, min_area=2)
+        if tag:
+            out.append(tag); cover[m] = 1
+    out += stroke_paths(items, geo, tol=tol, continuity=continuity)
+    if debug:
+        ws = [float(np.median(it["w"])) for it in items]
+        return out, cover > 0, dict(n_strokes=len(items), median_width_px=float(np.median(ws)) if ws else 0.0,
+                                    cubics=int(sum(d.count("C") for d in out)))
+    return out, cover > 0
+
+
+def _join_fit(pi, pj, P, tol_rel=0.025, tol_min=1.0, tol_max=3.0, ink_thr=0.15,
+              join_px=25, samples=14):
+    """Could pi + pj be ONE smooth line? One cubic must fit the joined pieces; a real S curve
+    may use two, but never more - a crossing welded into a kink would need several. On top of
+    that the seam must sit on ink, so a join never flies over blank paper."""
+    pts = _resample1(np.vstack([pi, pj]), 1.0)
+    if len(pts) < 6:
+        return False
+    L = np.hypot(*np.diff(pts, axis=0).T).sum()
+    tol = float(np.clip(tol_rel * L, tol_min, tol_max))
+    u = _chord_params(pts)
+    c = _fit_free(pts, u)
+    for _ in range(3):
+        u = _reparam(pts, c, u)
+        c = _fit_free(pts, u)
+    err, _at = _max_err(pts, c, u)
+    if err > tol:
+        t1 = _unit(pts[min(2, len(pts) - 1)] - pts[0])
+        t2 = _unit(pts[max(-3, -len(pts))] - pts[-1])
+        if len(fit_cubic(pts, t1, t2, max(tol, 1.2))) > 2:
+            return False
+    n = len(pi)
+    q = pts[max(0, n - join_px):min(len(pts), n + join_px)]
+    v = ndi.map_coordinates(P, [q[:, 1], q[:, 0]], order=1, mode="nearest")
+    return float(v.mean()) > ink_thr
+
+
+def merge_strokes(items, P, gap_max=14.0, cos_max=-0.5, rounds=8):
+    """Second merge pass, driven by FIT instead of by the end tangents: a crossing leaves the
+    skeleton with short, noisy branch ends, and a direction test alone then refuses to rejoin a
+    line that runs straight through. Accept a join when one cubic fits both pieces and the join
+    stays on ink."""
+    from scipy.spatial import cKDTree
+    items = [dict(pts=np.asarray(it["pts"], float), free=[bool(it["free"][0]), bool(it["free"][1])])
+             for it in items]
+    for _ in range(rounds):
+        live = [(i, e) for i, it in enumerate(items) if it is not None for e in (0, 1)]
+        if len(live) < 2:
+            break
+        E = np.array([items[i]["pts"][0 if e == 0 else -1] for i, e in live])
+        pairs = sorted(cKDTree(E).query_pairs(gap_max),
+                       key=lambda ab: np.linalg.norm(E[ab[0]] - E[ab[1]]))
+        used = set()
+        changed = False
+        for a, b in pairs:
+            (i, ei), (j, ej) = live[a], live[b]
+            if i == j or i in used or j in used or items[i] is None or items[j] is None:
+                continue
+            di = _out_dir(items[i]["pts"], ei)
+            dj = _out_dir(items[j]["pts"], ej)
+            if np.dot(di, dj) > cos_max:          # both ends point the same way: not a line
+                continue
+            pi = items[i]["pts"] if ei == 1 else items[i]["pts"][::-1]
+            pj = items[j]["pts"] if ej == 0 else items[j]["pts"][::-1]
+            if not _join_fit(pi, pj, P):
+                continue
+            fi = items[i]["free"][0] if ei == 1 else items[i]["free"][1]
+            fj = items[j]["free"][1] if ej == 0 else items[j]["free"][0]
+            items[i] = dict(pts=_resample1(np.vstack([pi, pj]), 1.0), free=[fi, fj])
+            items[j] = None
+            used |= {i, j}
+            changed = True
+        if not changed:
+            break
+        items = [it for it in items if it is not None]
+    return [it for it in items if it is not None]
+
+def _join_score(pi, pj, P, spacing):
+    """Score local continuation; only the gap itself counts as evidence for a bridge."""
+    a, b = pi[-1], pj[0]
+    gap = b - a
+    gl = np.linalg.norm(gap)
+    if spacing is not None:
+        sp = _sample(spacing, ((a + b) / 2 - 0.5)[None])[0]
+        if gl > np.clip(1.2 * sp, 4.0, 18.0):
+            return None
+    di = _out_dir(pi, 1, 7)
+    dj = -_out_dir(pj, 0, 7)
+    alignment = float(di @ dj)
+    if alignment < 0.45:
+        return None
+    strength = 1.0
+    if gl > 1.5:
+        u = gap / gl
+        if min(di @ u, dj @ u) < 0.64:
+            return None
+        q = a + np.linspace(0, 1, max(5, int(np.ceil(gl * 2)) + 1))[1:-1, None] * gap
+        v = _sample(P, q - 0.5)
+        strength = float(np.mean(v))
+        if gl > 3.0 and (strength < 0.16 or np.mean(v >= 0.10) < 0.65):
+            return None
+    pts = _resample_stroke(np.vstack([pi[-16:], pj[:16]]))
+    if len(pts) < 5:
+        return None
+    u = _chord_params(pts)
+    c = _fit_free(pts, u)
+    for _ in range(3):
+        u = _reparam(pts, c, u)
+        c = _fit_free(pts, u)
+    err, _ = _max_err(pts, c, u)
+    if err > 1.45:
+        return None
+    return float(err + 1.8 * (1 - alignment) + 0.04 * gl + 0.45 * (1 - strength))
+
+
+def merge_continuations(items, P, spacing=None, gap_max=18.0, rounds=8):
+    """Join locally compatible ends in score order, without repainting an unsupported gap."""
+    from scipy.spatial import cKDTree
+    items = [dict(pts=np.asarray(it["pts"], float), free=[bool(it["free"][0]), bool(it["free"][1])])
+             for it in items]
+    for _ in range(rounds):
+        live = [(i, e) for i, it in enumerate(items) if it is not None for e in (0, 1)]
+        if len(live) < 2:
+            break
+        E = np.array([items[i]["pts"][0 if e == 0 else -1] for i, e in live])
+        pairs = []
+        for a, b in cKDTree(E).query_pairs(gap_max):
+            i, ei = live[a]
+            j, ej = live[b]
+            if i == j:
+                continue
+            pi = items[i]["pts"] if ei == 1 else items[i]["pts"][::-1]
+            pj = items[j]["pts"] if ej == 0 else items[j]["pts"][::-1]
+            score = _join_score(pi, pj, P, spacing)
+            if score is not None:
+                pairs.append((score, a, b))
+        used = set()
+        changed = False
+        for _, a, b in sorted(pairs):
+            (i, ei), (j, ej) = live[a], live[b]
+            if i == j or i in used or j in used or items[i] is None or items[j] is None:
+                continue
+            pi = items[i]["pts"] if ei == 1 else items[i]["pts"][::-1]
+            pj = items[j]["pts"] if ej == 0 else items[j]["pts"][::-1]
+            fi = items[i]["free"][0] if ei == 1 else items[i]["free"][1]
+            fj = items[j]["free"][1] if ej == 0 else items[j]["free"][0]
+            items[i] = dict(pts=_resample_stroke(np.vstack([pi, pj])), free=[fi, fj])
+            items[j] = None
+            used |= {i, j}
+            changed = True
+        if not changed:
+            break
+        items = [it for it in items if it is not None]
+    return [it for it in items if it is not None]

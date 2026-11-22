@@ -1,0 +1,16 @@
+# 原生运行（不用 Docker）依赖。torch 不在这里：先装和显卡匹配的 CUDA 版本，见 scripts/setup_windows.ps1
+numpy
+pillow
+opencv-python-headless
+scikit-image<0.27
+scipy
+vtracer==1.0.0a3
+flask
+waitress
+
+# 可选：历史列表的 PNG 预览（Windows 需要 libcairo/GTK）。没有也能用：
+# 网页会用管线自身的工作栅格生成预览（见 webui._raster_preview）。
+# cairosvg
+
+# 纯色色区的共享边界几何校验
+shapely>=2.0,<3

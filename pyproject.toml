@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumina-imtvec"
+version = "1.0.0"
+description = "Lumina-IMTVec: illustration to dual-layer planar vector SVG engine for Lumina multi-color layer-stack 3D printing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pillow",
+    "opencv-python-headless",
+    "scikit-image<0.27",
+    "scipy",
+    "vtracer==1.0.0a3",
+    "flask",
+    "waitress",
+    "shapely>=2.0,<3",
+]
+
+[tool.setuptools.packages.find]
+include = ["lumina_vec*"]
