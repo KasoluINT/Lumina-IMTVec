@@ -1,4 +1,8 @@
 ﻿<#
+  Copyright 2026 MESFET5198 (Lumina-Vec, Apache License 2.0)
+  Modified 2026 by KasoluINT (Lumina-IMTVec): switched to pure ONNX Runtime DirectML (zero PyTorch/vtracer).
+  See LICENSE-APACHE-2.0 and NOTICE for full license and attribution notices.
+
   一次性轻量化安装（Windows 原生运行，纯 ONNX Runtime DirectML，无需安装 PyTorch / CUDA，也无需额外下载权重）：
 
       powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
@@ -24,7 +28,7 @@ if (-not (Test-Path $venvPython)) {
 }
 & $venvPython -m pip install --upgrade pip --quiet
 
-Write-Host "installing runtime dependencies (onnxruntime-directml, vtracer, shapely, etc.)"
+Write-Host "installing runtime dependencies (onnxruntime-directml, shapely, opencv, etc.)"
 & $venvPython -m pip install -r requirements-native.txt
 if ($CpuOnly) {
     & $venvPython -m pip uninstall -y onnxruntime-directml | Out-Null

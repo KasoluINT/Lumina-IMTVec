@@ -4,7 +4,6 @@ pillow
 opencv-python-headless
 scikit-image<0.27
 scipy
-vtracer==1.0.0a3
 onnxruntime-directml; sys_platform == "win32"
 onnxruntime; sys_platform != "win32"
 flask

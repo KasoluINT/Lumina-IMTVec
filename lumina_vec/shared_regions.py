@@ -1,75 +1,9 @@
 """Planar colour regions assembled from curves fitted once per shared boundary."""
 from collections import defaultdict
-import re
-import xml.etree.ElementTree as ET
 import numpy as np
-import vtracer
 import cv2
-from scipy.ndimage import gaussian_filter1d, median, map_coordinates
-from .contour import fit_cubic, _unit
-
-
-def _pixel_loops(d):
-    tokens=re.findall(r'[MLHVZmlhvz]|-?\d+(?:\.\d+)?',d)
-    point=np.zeros(2);start=point.copy();loop=[];i=0;cmd=None
-    while i<len(tokens):
-        if tokens[i].isalpha():
-            cmd=tokens[i];i+=1
-            if cmd.upper()=='Z':
-                yield np.array(loop+[start.copy()],int)
-                point=start.copy();loop=[];continue
-        n=1 if cmd.upper() in ('H','V') else 2
-        values=np.array([float(v) for v in tokens[i:i+n]]);i+=n
-        q=point.copy()
-        if cmd.upper() in ('M','L'): q=values+(point if cmd.islower() else 0)
-        else:
-            axis=0 if cmd.upper()=='H' else 1
-            q[axis]=values[0]+(point[axis] if cmd.islower() else 0)
-        point=q
-        if cmd.upper()=='M': start=q.copy();cmd='l' if cmd.islower() else 'L'
-        loop.append(q.copy())
-
-
-def segment(rgb, precision=7, difference=12, speckle=1, representative='median'):
-    """Use the clusterer only; its pixel contours are an intermediate label map."""
-    h,w=rgb.shape[:2]
-    cfg=vtracer.Config(color_precision=precision,layer_difference=difference,
-                       filter_speckle=speckle,hierarchical='cutout',mode='pixel')
-    raw=cfg.convert_pixels(np.dstack([rgb,np.full((h,w),255,np.uint8)]).tobytes(),w,h)
-    labels=np.full((h,w),-1,np.int32)
-    colors=[]
-    for path in ET.fromstring(raw):
-        if not path.tag.endswith('path'): continue
-        index=len(colors);colors.append(path.get('fill'))
-        events=defaultdict(list)
-        for xy in _pixel_loops(path.get('d','')):
-            if not np.array_equal(xy[0],xy[-1]): xy=np.vstack([xy,xy[0]])
-            for a,b in zip(xy[:-1],xy[1:]):
-                if a[0]!=b[0]: continue
-                for y in range(max(0,min(a[1],b[1])),min(h,max(a[1],b[1]))):
-                    events[y].append(int(a[0]))
-        for y,xs in events.items():
-            xs.sort()
-            assert len(xs)%2==0,(path.attrib,y,xs)
-            for a,b in zip(xs[::2],xs[1::2]): labels[y,max(0,a):min(w,b)]=index
-    assert (labels>=0).all(), 'Clustering left uncovered pixels'
-    # Cluster averages are contaminated by antialiased boundary pixels.
-    # Recover each region's representative source colour before fitting geometry.
-    if representative=='mode':
-        # Channel-wise medians can invent RGB triplets absent from an already
-        # quantized image. Select one existing complete RGB colour per region.
-        pixels=rgb.astype(np.int64)
-        packed=(pixels[:,:,0]<<16)|(pixels[:,:,1]<<8)|pixels[:,:,2]
-        keys,counts=np.unique((labels.astype(np.int64)<<24)|packed,return_counts=True)
-        region=keys>>24;order=np.lexsort((keys,-counts,region));keys=keys[order];region=region[order]
-        first=np.r_[True,region[1:]!=region[:-1]];chosen=keys[first]&0xffffff
-        values=np.zeros((len(colors),3),np.uint8)
-        values[region[first]]=np.column_stack([chosen>>16,(chosen>>8)&255,chosen&255])
-    elif representative=='median':
-        values=np.stack([median(rgb[:,:,c],labels,np.arange(len(colors))) for c in range(3)],axis=1)
-    else:raise ValueError('Unknown region colour representative')
-    colors=['#%02x%02x%02x'%tuple(np.rint(v).astype(int)) for v in values]
-    return labels,colors
+from scipy.ndimage import gaussian_filter1d, map_coordinates
+from .bezier_fit import fit_cubic, _unit, cubic_to_svg_arc
 
 
 def boundary_graph(labels):
@@ -253,8 +187,7 @@ def _compact_command(curve, tol_q=0.25, tol_a=0.35):
                 and abs(v[0]*(c-a)[1]-v[1]*(c-a)[0])<=1e-8):
             return 'L%.3f,%.3f'%tuple(d)
     if tol_a>0 and square>4.0:
-        from .layered import _cubic_to_arc
-        arc=_cubic_to_arc(curve,tol=tol_a,n=9)
+        arc=cubic_to_svg_arc(curve,tol=tol_a,n=9)
         if arc is not None:
             return arc
     # Exact max deviation of degree-reduced quadratic Q(q) from cubic (a,b,c,d):
@@ -265,20 +198,31 @@ def _compact_command(curve, tol_q=0.25, tol_a=0.35):
     return 'C%.3f,%.3f %.3f,%.3f %.3f,%.3f'%tuple(curve[1:].ravel())
 
 
+def _is_canvas_frame(points, h, w):
+    """True only when every point of a chain sits strictly on the outer rectangular canvas border."""
+    xs = points[:, 0]
+    ys = points[:, 1]
+    on_frame = (xs <= 0.0) | (xs >= float(w)) | (ys <= 0.0) | (ys >= float(h))
+    return bool(np.all(on_frame))
+
+
 def trace_regions(labels,colors,tol=.35,seam=0,rgb=None,placement='normal',geometry_guard=False,smoothing=.65,structural_scale=None,source_scale=1.,structural_fitter=None,secondary_fitter=None, secondary_network=None, *, exact_grid=False, compact_commands=False, chain_locator=None, chain_scale_fn=None):
+    h,w=labels.shape
     chains,atomic_edges=boundary_graph(labels)
     faces=defaultdict(list)
     for i,c in enumerate(chains):
         locate={'normal':_subpixel,'marching':_marching,'coverage':_coverage_boundary}[placement]
         fit_points=locate(c['points']/source_scale,c['right'],c['left'],rgb,colors)*source_scale if rgb is not None else c['points']
-        if exact_grid or c['right']<0 or c['left']<0:
+        is_frame = (c['right']<0 or c['left']<0) and _is_canvas_frame(c['points'], h, w)
+        c['_is_frame'] = is_frame
+        if exact_grid or is_frame:
             p=c['points']
             turns=np.flatnonzero(np.any(np.diff(p,n=2,axis=0)!=0,axis=1))+1
             p=p[np.r_[0,turns,len(p)-1]]
             c['curves']=[np.array([a,a+(b-a)/3,a+(b-a)*2/3,b]) for a,b in zip(p[:-1],p[1:])]
         else:
             original_points=fit_points
-            if chain_locator is not None:
+            if chain_locator is not None and min(c['right'], c['left']) >= 0:
                 fit_points=chain_locator(fit_points,c['right'],c['left'],source_scale)
             if structural_scale is not None:
                 from .structural_curves import fit_structural
@@ -302,7 +246,7 @@ def trace_regions(labels,colors,tol=.35,seam=0,rgb=None,placement='normal',geome
         prior=[chain['curves'] for chain in chains]
         before=sum(map(len,prior))
         for chain in chains:
-            if secondary_fitter is not None and min(chain['left'], chain['right']) >= 0:
+            if secondary_fitter is not None and not chain.get('_is_frame', False):
                 chain['curves']=secondary_fitter(chain['curves'], chain.get('_scale', structural_scale))
         if secondary_network is not None:
             secondary_network(chains, structural_scale)
@@ -314,7 +258,8 @@ def trace_regions(labels,colors,tol=.35,seam=0,rgb=None,placement='normal',geome
         if d==1: return c['vertices'][0],c['vertices'][-1],c['points'],c['curves']
         return c['vertices'][-1],c['vertices'][0],c['points'][::-1],[s[::-1] for s in c['curves'][::-1]]
     paths=[];loops=0
-    for face,refs in faces.items():
+    for face in sorted(faces):
+        refs = faces[face]
         outgoing=defaultdict(list)
         for ref in refs: outgoing[oriented(ref)[0]].append(ref)
         used=set();parts=[]

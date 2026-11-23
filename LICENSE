@@ -2,6 +2,18 @@ MIT License
 
 Copyright (c) 2026 KasoluINT (Lumina-IMTVec)
 
+Upstream Attribution & Apache-2.0 Notice:
+This repository contains files originally from Lumina-Vec
+(Copyright 2026 MESFET5198, https://github.com/MESFET5198/Lumina-Vec),
+licensed under the Apache License, Version 2.0:
+  - webui.py, index.html, lumina_vec/color.py, lumina_vec/pipeline.py,
+    lumina_vec/presets.py, scripts/setup_windows.ps1, scripts/start_web.bat
+Those files remain subject to the Apache License, Version 2.0 (full text in
+LICENSE-APACHE-2.0) and the upstream attribution notices preserved in NOTICE.
+New original modules authored for Lumina-IMTVec are licensed under the MIT
+License below. See THIRD_PARTY_LICENSES.md for bundled model weights
+(including Real-ESRGAN BSD-3-Clause) and runtime dependencies.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

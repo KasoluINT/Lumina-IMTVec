@@ -25,3 +25,7 @@ data/
 tools/
 lumina_vec/feature_nets.py
 scripts/download_weights.py
+
+# Heavy External AI Model Caches (WD14 / HuggingFace SDXL & ControlNet)
+weights/hf_cache/
+weights/wd14/

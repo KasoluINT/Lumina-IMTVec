@@ -1,6 +1,24 @@
 # CHANGELOG · Lumina-IMTVec 架构与改动记录
 
-记录从 `v10` 单网格基准到 `v24`/`v25` 矢量场 CNN 重构，再到 **Lumina-IMTVec `v1.0.1`** 纯 ONNX DirectML 免 PyTorch 部署与动态 GPU 显存自适应的完整演进。
+记录从 `v10` 单网格基准到 `v24`/`v25` 矢量场 CNN 重构，再到 **Lumina-IMTVec `v1.0.2`** 透明底无损矢量化、可选轻量 AI 平涂预处理、代码库彻底精简与 Apache-2.0 合规化的完整演进。
+
+---
+
+## [Lumina-IMTVec v1.0.2] · 2026-11-24 · 透明底无损矢量化 + 可选 AI 平涂预处理 + 架构精简与 Apache-2.0 合规
+
+### 核心更新
+- **RGBA 透明底无损转矢量 SVG（`print_partition.py`、`planar_partition.py`、`shared_regions.py`、`svg_layers.py`、`webui.py`）**：
+  - 修复透明底 PNG/WebP 转换后重新出现实心底色的问题：提取原生 Alpha 通道并对边缘做距离变换真彩外扩（消除超分与抗锯齿产生的黑/白杂晕），平面分割中将透明外域与内部透明镂空洞隔离为 `-1`（不生成任何底色 `<path>`）；
+  - `shared_regions.py` 新增 `_is_canvas_frame` 区分画布直边框与弯曲透明外轮廓，使透明抠图弧边与内部镂空洞完整走三次贝塞尔平滑拟合；
+  - `svg_layers.py` 改为按真实 `region-{id}` 对齐线稿/填充层；WebUI 同步输出 `RGBA` 透明预览并在历史缩略图与热力图中自动合底，删除任务时一并清理 `.heatmap.png`。
+- **可选轻量「AI 平涂重绘预处理（核心极简管线）」（`lumina_vec/ai_repaint.py`、`index.html`、`feature_routing.py`）**：
+  - 前端新增默认不勾选的 `#aiRepaint` 选项（不勾选走原版完整 CNN 管线；勾选走 OKLab 暗发大色块合并 + 墨线锁边平涂 + 精简 `core_mode` 核心管线，零 SDXL/ControlNet 显存膨胀）；
+  - 针对浅亮肤色与柔和腮红引入独立 5 阶 OKLab 感知均匀柔和子色板与 `line_net` 五官细墨线兜底，消除腮红色阶硬切并完整保留微笑唇线、小虎牙与花朵细节。
+- **彻底清理死代码与历史遗留**：
+  - 删除 41 个旧版/废弃文件（含全部 16 个与 `0.9.2` 逐字节相同文件及 25 个过渡废弃模块），`lumina_vec/` 精简为 19 个 100% 可达核心模块，新建独立曲线拟合模块 `lumina_vec/bezier_fit.py`；
+  - 从 `requirements-native.txt`、`pyproject.toml`、`webui.py`、`index.html` 彻底移除未使用的 `vtracer` 与死路由参数（`print_mm` / `line_mm`）。
+- **开源授权与上游署名合规化**：
+  - 补全 Apache-2.0 四件套：新增完整正文 [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0)、逐字保留上游归属的 [NOTICE](NOTICE)、第三方权重与依赖清单 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)（含 `realesr_anime.onnx` BSD-3-Clause），并在全部 7 个上游演化文件头标注 `Copyright 2026 MESFET5198` 及改动说明。
 
 ---
 

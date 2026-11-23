@@ -1,13 +1,13 @@
 """把一次转换放到独立进程里跑。
 
-为什么要独立进程：描摹（vtracer 的 Rust 调用 + 大量 numpy/opencv 循环）是一次很长的原生调用，
-长时间持有 GIL。在 Web 服务进程里直接跑，会把 waitress 的请求线程全部堵死——实测转换期间
+为什么要独立进程：矢量场 CNN 与平面分割计算会长时间占用原生计算线程并持有 GIL。
+在 Web 服务进程里直接跑，会把 waitress 的请求线程全部堵死——实测转换期间
 /api/status 和 /healthz 都会超时（>3 s），网页就一直停在"排队中"，直到转换结束才恢复。
 
 用法（webui 内部调用，命令行也能直接用）：
 
-    python -m lumina_vec.worker --image in.png --out out.svg --preset auto \
-        --overrides '{"structure":"lumina"}' [--preview preview.png] [--fine 1] [--weights w.pth]
+    python -m lumina_vec.worker --image in.png --out out.svg --preset print-regions \
+        --overrides '{}' [--preview preview.png] [--fine 1]
 
 标准输出约定（webui 逐行解析）：
     #PROGRESS <0..1> <阶段名>

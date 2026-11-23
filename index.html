@@ -1,4 +1,10 @@
 <!doctype html>
+<!--
+  Copyright 2026 MESFET5198 (Lumina-Vec, Apache License 2.0)
+  Modified 2026 by KasoluINT (Lumina-IMTVec): simplified to CNN two-layer mode,
+  added AI flat repaint toggle, layer inspection & RGBA checkerboard support.
+  See LICENSE-APACHE-2.0 and NOTICE for full license and attribution notices.
+-->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -145,16 +151,14 @@ header .health{margin-left:auto;font-size:12px;color:var(--muted);display:flex;a
       <h2 id="modeTitle">转换模式</h2>
       <div class="presets" id="presets" role="radiogroup" aria-labelledby="modeTitle">
         <label class="preset sel"><input type="radio" name="preset" value="print-regions" checked>
-          <div><b>双层矢量（推荐 · 矢量场 CNN）</b><span>自动启用 LineVectorNet 矢量场直出 Cubic Bezier 线稿层与无溢色边界约束着色层</span></div>
-        </label>
-        <label class="preset"><input type="radio" name="preset" value="auto">
-          <div><b>自动</b><span>根据图片自动选用预设</span></div>
-        </label>
-        <label class="preset"><input type="radio" name="preset" value="illustration">
-          <div><b>Illustration</b><span>适用于插画的传统色块描摹</span></div>
+          <div><b>双层矢量（矢量场 CNN）</b><span>启用 LineVectorNet 矢量场直出 Cubic Bezier 线稿层与无溢色边界约束着色层（支持透明底）</span></div>
         </label>
       </div>
       <div id="printRegionsOpts" style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+        <label id="aiRepaintWrap" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;cursor:pointer">
+          <input type="checkbox" id="aiRepaint" style="margin-top:2px">
+          <span><b>AI 平涂重绘预处理（核心极简管线）</b><br><small style="color:var(--muted)">勾选：墨线锁边平涂大色块 + 精简核心矢量；不勾选：直接使用原版完整管线</small></span>
+        </label>
         <label id="featureRoutingWrap" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;cursor:pointer">
           <input type="checkbox" id="featureRouting" checked style="margin-top:2px">
           <span><b>CNN 智能特征路由（默认开启）</b><br><small id="cnnHint" style="color:var(--muted)">自动识别表面风格、眼部/嘴部微细特征、发丝与噪点并优化去杂与色块合并</small></span>
@@ -230,8 +234,6 @@ const STRUCTURE_LABELS = {
 };
 const MODE_OPTIONS = {
   'print-regions': {structure: 'print-regions', bands: '84', gradient_mode: 'clean'},
-  auto: {structure: 'regions'},
-  illustration: {structure: 'regions'},
 };
 let file = null, job = null, poll = null, srcURL = null;
 
@@ -274,6 +276,7 @@ $('#go').onclick = () => {
   fd.append('preset', preset);
   for (const [key, value] of Object.entries(MODE_OPTIONS[preset])) fd.append(key, value);
   if (preset === 'print-regions') {
+    fd.append('ai_repaint', $('#aiRepaint').checked ? '1' : '0');
     fd.append('smooth_lines', $('#smoothLines').checked ? '1' : '0');
     fd.append('feature_routing', $('#featureRouting').checked ? '1' : '0');
     fd.append('sr_scale', $('#srScale').value || '2');
@@ -502,10 +505,15 @@ function esc(t) { return t.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 fetch('/healthz').then(r => r.json()).then(h => {
   $('#hdot').className = 'dot ' + (h.weights ? 'ok' : 'bad');
   if (h.cnn_ready) {
-    $('#htext').textContent = '服务正常 · ' + (h.vector_ready ? 'LineVectorNet 矢量场已加载' : 'CNN 已加载') + (h.directml ? ' (DirectML)' : ' (CPU)');
+    $('#htext').textContent = '服务正常 · ' + (h.vector_ready ? 'LineVectorNet 矢量场已加载' : 'CNN 已加载') + (h.ai_repaint_ready ? ' · 支持平涂重绘' : '') + (h.directml ? ' (DirectML)' : ' (CPU)');
+    if (!h.ai_repaint_ready && $('#aiRepaint')) {
+      $('#aiRepaint').checked = false;
+      $('#aiRepaint').disabled = true;
+    }
   } else {
     $('#htext').textContent = h.weights ? '服务正常（未检测到 CNN ONNX 权重）' : '缺少模型权重';
     if ($('#cnnHint')) $('#cnnHint').textContent = '未检测到 weights/*.onnx，将自动回退至传统规则路由';
+    if ($('#aiRepaint')) { $('#aiRepaint').checked = false; $('#aiRepaint').disabled = true; }
   }
   if (h.version) $('#ver').textContent = 'v' + h.version;
 }).catch(() => { $('#hdot').className = 'dot bad'; $('#htext').textContent = '服务不可用'; });

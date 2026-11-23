@@ -1,0 +1,31 @@
+Lumina-Vec
+Copyright 2026 MESFET5198
+https://github.com/MESFET5198/Lumina-Vec
+
+This product includes software developed by MESFET5198 (Lumina-Vec).
+Redistributions and derivative works must keep this NOTICE file and the
+copyright, license and attribution notices in the source files.
+
+Third-party code included in this repository:
+- lumina_vec/manga_net.py: network definition from MangaLineExtraction_PyTorch,
+  MIT License, Copyright (c) 2021 Miaomiao Li.
+
+Model weights are not distributed with this repository; each is downloaded
+separately under its own license (see README).
+
+================================================================================
+Derivative Work Notice (Lumina-IMTVec)
+Copyright (c) 2026 KasoluINT (Lumina-IMTVec)
+
+This repository (Lumina-IMTVec) is a derivative work built upon Lumina-Vec
+(Copyright 2026 MESFET5198, licensed under the Apache License, Version 2.0;
+see LICENSE-APACHE-2.0).
+
+Summary of changes from upstream Lumina-Vec:
+- Modified upstream files retaining Apache-2.0 attribution:
+  webui.py, index.html, lumina_vec/color.py, lumina_vec/pipeline.py,
+  lumina_vec/presets.py, scripts/setup_windows.ps1, scripts/start_web.bat.
+- Removed lumina_vec/manga_net.py, vtracer bindings, and legacy v0.9.2 modules.
+- Replaced core vectorization pipeline with pure-ONNX multi-CNN planar partition
+  engine, RGBA transparency preservation, VRAM guard, and optional Ink-Locked
+  Flat preprocessing (see THIRD_PARTY_LICENSES.md for all bundled weights).

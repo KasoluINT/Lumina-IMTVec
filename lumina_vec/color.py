@@ -1,3 +1,6 @@
+# Copyright 2026 MESFET5198 (Lumina-Vec, Apache License 2.0)
+# Modified 2026 by KasoluINT (Lumina-IMTVec): added vectorized OKLab LUT conversion helpers.
+# See LICENSE-APACHE-2.0 and NOTICE for full license and attribution notices.
 """Colour helpers."""
 import numpy as np
 

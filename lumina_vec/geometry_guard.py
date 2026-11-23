@@ -1,7 +1,7 @@
 """Reject fitted shared boundaries that cross or touch away from junctions."""
 import numpy as np
 from shapely import LineString,Point,STRtree
-from .contour import fit_cubic,_unit
+from .bezier_fit import fit_cubic, _unit
 
 def flatten(c,tolerance=.015,depth=0):
     if np.max(np.abs(c-c[0]))<1e-12:return [c[-1]]

@@ -657,9 +657,15 @@ def infer_feature_maps(
     rgb: np.ndarray,
     weights_dir: str | Path | None = None,
     sr_scale: float | None = None,
+    core_mode: bool = False,
 ) -> FeatureMaps | None:
     """Whole-image magnification (default 2x, optional 5x / 10x) -> Pre-flatten closed-region
-    Gradient CNN (95% core + 5% line buffer) -> Skip pure-gradient tiles during LineVectorNet."""
+    Gradient CNN (95% core + 5% line buffer) -> Skip pure-gradient tiles during LineVectorNet.
+
+        When `core_mode=True` (for AI-repainted clean flat/cel inputs), bypasses redundant JPEG/raw-noise
+    repair passes (`_pre_sr_denoise_1x`, `DefectRepairNet`, `_reprocess_after_zoom`, `_suppress_dense_highlight_plateaus`)
+    while retaining core `RealESR 2x + _flatten_sr_for_lines + ElementGradNet + LineVectorNet + LineNet`.
+    """
     wdir = Path(weights_dir) if weights_dir else Path(os.environ.get("LUMINA_WEIGHTS_DIR", str(_WEIGHTS_DEFAULT)))
     p_sr = wdir / "realesr_anime.onnx"
     p_def = wdir / "defect_repair_net.onnx"
@@ -691,21 +697,26 @@ def infer_feature_maps(
         req_zoom = 2.0
     eff_zoom = req_zoom
 
-    # 1. Pre-analyze 1x semantic/surface priors (lazy load & optional eviction for low VRAM)
-    sess_part = _get_session(p_part, **sess_kw)
-    parts_pre = _run_dense_unet(sess_part, rgb, out_ch=4, hi_weight=0.70, sess_path=p_part) if sess_part is not None else np.zeros((4, h, w), np.float32)
-    if profile.evict_per_stage and sess_part is not None:
-        release_session(f"{p_part}|cpu={int(profile.force_cpu)}")
+    # 1. Pre-analyze 1x semantic/surface priors (bypassed in core_mode since Ink-Locked Flat input is already clean cel)
+    if core_mode:
+        parts_pre = np.zeros((4, h, w), np.float32)
+        surf_pre = np.zeros((4, h, w), np.float32)
+        surf_pre[0] = 1.0
+    else:
+        sess_part = _get_session(p_part, **sess_kw)
+        parts_pre = _run_dense_unet(sess_part, rgb, out_ch=4, hi_weight=0.70, sess_path=p_part) if sess_part is not None else np.zeros((4, h, w), np.float32)
+        if profile.evict_per_stage and sess_part is not None:
+            release_session(f"{p_part}|cpu={int(profile.force_cpu)}")
 
-    sess_surf = _get_session(p_surf, **sess_kw)
-    surf_pre = _run_surface_cnn(sess_surf, rgb, batch_size=profile.surface_batch, sess_path=p_surf) if sess_surf is not None else np.full((4, h, w), 0.25, np.float32)
-    if profile.evict_per_stage and sess_surf is not None:
-        release_session(f"{p_surf}|cpu={int(profile.force_cpu)}")
+        sess_surf = _get_session(p_surf, **sess_kw)
+        surf_pre = _run_surface_cnn(sess_surf, rgb, batch_size=profile.surface_batch, sess_path=p_surf) if sess_surf is not None else np.full((4, h, w), 0.25, np.float32)
+        if profile.evict_per_stage and sess_surf is not None:
+            release_session(f"{p_surf}|cpu={int(profile.force_cpu)}")
 
     # 2. Whole-image magnification (adaptive dynamic pixel & VRAM cap for low-end PCs)
     zoom_rgb = None
     if p_sr.is_file() and (p_line.is_file() or p_vec.is_file() or p_def.is_file()):
-        rgb_for_sr = _pre_sr_denoise_1x(rgb, parts_pre, surf_pre)
+        rgb_for_sr = rgb if core_mode else _pre_sr_denoise_1x(rgb, parts_pre, surf_pre)
         px_1x = h * w
         if px_1x >= 10_000_000:
             work_scale = 1.0
@@ -739,56 +750,61 @@ def infer_feature_maps(
     parts = parts_pre.copy()
     surf = surf_pre
 
-    # 3. DefectRepairNet BEFORE ElementGradNet so JPEG artifacts are fixed without MeanShift blurring
+    # 3. DefectRepairNet, ElementGradNet & SR flattening (bypassed in core_mode since Ink-Locked Flat input is already solid flat colors!)
     defect_prob = None
-    sess_def = _get_session(p_def, **sess_kw)
-    if sess_def is not None:
-        if sr_hi is not None:
-            sr_hi, defect_prob = _run_defect_repair_cnn(sess_def, sr_hi, parts, sess_path=p_def)
-        else:
-            feat_rgb, defect_prob = _run_defect_repair_cnn(sess_def, feat_rgb, parts, sess_path=p_def)
-        if profile.evict_per_stage:
-            release_session(f"{p_def}|cpu={int(profile.force_cpu)}")
-
-    pre_flat_1x = cv2.resize(sr_hi, (w, h), interpolation=cv2.INTER_AREA) if sr_hi is not None else feat_rgb
-    sess_elem = _get_session(p_elem, **sess_kw)
-    elem_maps = _run_dense_unet(sess_elem, pre_flat_1x, out_ch=8, hi_weight=0.55, sess_path=p_elem) if sess_elem is not None else None
-    if profile.evict_per_stage and sess_elem is not None:
-        release_session(f"{p_elem}|cpu={int(profile.force_cpu)}")
-    if elem_maps is not None:
-        grad_core_95, line_buffer_5 = _compute_grad_core_and_buffer(elem_maps, parts_pre)
-        # Prevent Gradient-CNN from crossing crisp/soft color-step edges (e.g. borderless eyes/iris)
-        from .color import srgb_to_oklab
-        ok1 = srgb_to_oklab(rgb).astype(np.float32)
-        g1h = np.zeros((h, w), np.float32)
-        g1v = np.zeros((h, w), np.float32)
-        dh = np.sqrt(((ok1[:, 1:, :] - ok1[:, :-1, :]) ** 2).sum(axis=2))
-        dv = np.sqrt(((ok1[1:, :, :] - ok1[:-1, :, :]) ** 2).sum(axis=2))
-        g1h[:, :-1] = np.maximum(g1h[:, :-1], dh); g1h[:, 1:] = np.maximum(g1h[:, 1:], dh)
-        g1v[:-1, :] = np.maximum(g1v[:-1, :], dv); g1v[1:, :] = np.maximum(g1v[1:, :], dv)
-        g1_edge = np.hypot(g1h, g1v)
-        g2_edge = np.zeros((h, w), np.float32)
-        for dy_s, dx_s in ((2, 0), (0, 2), (2, 2), (2, -2)):
-            p1 = np.roll(np.roll(ok1, -dy_s, axis=0), -dx_s, axis=1)
-            p2 = np.roll(np.roll(ok1, dy_s, axis=0), dx_s, axis=1)
-            g2_edge = np.maximum(g2_edge, np.sqrt(((p1 - p2) ** 2).sum(axis=2)))
-        real_color_edge = ((g2_edge >= 0.028) & (g1_edge >= 0.010)) | (g1_edge >= 0.028)
-        if real_color_edge.any():
-            edge_guard = cv2.dilate(real_color_edge.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
-            invaded = grad_core_95 & edge_guard
-            if invaded.any():
-                grad_core_95 &= ~invaded
-                line_buffer_5 |= invaded
-    else:
+    elem_maps = None
+    if core_mode:
         grad_core_95 = np.zeros((h, w), bool)
         line_buffer_5 = np.zeros((h, w), bool)
-
-    if sr_hi is not None:
-        sr_hi = _flatten_sr_for_lines(sr_hi, parts, surf)
-        sr_clean_1x = cv2.resize(sr_hi, (w, h), interpolation=cv2.INTER_AREA)
-        feat_rgb = sr_clean_1x
     else:
-        feat_rgb = _flatten_sr_for_lines(feat_rgb, parts, surf)
+        sess_def = _get_session(p_def, **sess_kw)
+        if sess_def is not None:
+            if sr_hi is not None:
+                sr_hi, defect_prob = _run_defect_repair_cnn(sess_def, sr_hi, parts, sess_path=p_def)
+            else:
+                feat_rgb, defect_prob = _run_defect_repair_cnn(sess_def, feat_rgb, parts, sess_path=p_def)
+            if profile.evict_per_stage:
+                release_session(f"{p_def}|cpu={int(profile.force_cpu)}")
+
+        pre_flat_1x = cv2.resize(sr_hi, (w, h), interpolation=cv2.INTER_AREA) if sr_hi is not None else feat_rgb
+        sess_elem = _get_session(p_elem, **sess_kw)
+        elem_maps = _run_dense_unet(sess_elem, pre_flat_1x, out_ch=8, hi_weight=0.55, sess_path=p_elem) if sess_elem is not None else None
+        if profile.evict_per_stage and sess_elem is not None:
+            release_session(f"{p_elem}|cpu={int(profile.force_cpu)}")
+        if elem_maps is not None:
+            grad_core_95, line_buffer_5 = _compute_grad_core_and_buffer(elem_maps, parts_pre)
+            # Prevent Gradient-CNN from crossing crisp/soft color-step edges (e.g. borderless eyes/iris)
+            from .color import srgb_to_oklab
+            ok1 = srgb_to_oklab(rgb).astype(np.float32)
+            g1h = np.zeros((h, w), np.float32)
+            g1v = np.zeros((h, w), np.float32)
+            dh = np.sqrt(((ok1[:, 1:, :] - ok1[:, :-1, :]) ** 2).sum(axis=2))
+            dv = np.sqrt(((ok1[1:, :, :] - ok1[:-1, :, :]) ** 2).sum(axis=2))
+            g1h[:, :-1] = np.maximum(g1h[:, :-1], dh); g1h[:, 1:] = np.maximum(g1h[:, 1:], dh)
+            g1v[:-1, :] = np.maximum(g1v[:-1, :], dv); g1v[1:, :] = np.maximum(g1v[1:, :], dv)
+            g1_edge = np.hypot(g1h, g1v)
+            g2_edge = np.zeros((h, w), np.float32)
+            for dy_s, dx_s in ((2, 0), (0, 2), (2, 2), (2, -2)):
+                p1 = np.roll(np.roll(ok1, -dy_s, axis=0), -dx_s, axis=1)
+                p2 = np.roll(np.roll(ok1, dy_s, axis=0), dx_s, axis=1)
+                g2_edge = np.maximum(g2_edge, np.sqrt(((p1 - p2) ** 2).sum(axis=2)))
+            real_color_edge = ((g2_edge >= 0.028) & (g1_edge >= 0.010)) | (g1_edge >= 0.028)
+            if real_color_edge.any():
+                edge_guard = cv2.dilate(real_color_edge.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+                invaded = grad_core_95 & edge_guard
+                if invaded.any():
+                    grad_core_95 &= ~invaded
+                    line_buffer_5 |= invaded
+        else:
+            grad_core_95 = np.zeros((h, w), bool)
+            line_buffer_5 = np.zeros((h, w), bool)
+
+        if sr_hi is not None:
+            sr_hi = _flatten_sr_for_lines(sr_hi, parts, surf)
+            sr_clean_1x = cv2.resize(sr_hi, (w, h), interpolation=cv2.INTER_AREA)
+            feat_rgb = sr_clean_1x
+        else:
+            feat_rgb = _flatten_sr_for_lines(feat_rgb, parts, surf)
 
     # 4. LineVectorNet (skips 512x512 tiles safely enclosed inside 95%-shrunk gradient cores!)
     vec_fields = None
@@ -813,7 +829,8 @@ def infer_feature_maps(
             vh, vw = vec_in.shape[:2]
             grad_core_hi = cv2.resize(grad_core_95.astype(np.uint8), (vw, vh), interpolation=cv2.INTER_NEAREST) > 0
             vec_fields, skipped_vec_tiles, total_vec_tiles = _run_dense_unet(sess_vec, vec_in, out_ch=9, hi_weight=1.0, skip_mask=grad_core_hi, sess_path=p_vec)
-            vec_fields = _suppress_dense_highlight_plateaus(vec_fields, vec_in, grad_core_hi=grad_core_hi)
+            if not core_mode:
+                vec_fields = _suppress_dense_highlight_plateaus(vec_fields, vec_in, grad_core_hi=grad_core_hi)
         if profile.evict_per_stage:
             release_session(f"{p_vec}|cpu={int(profile.force_cpu)}")
     sess_line = _get_session(p_line, **sess_kw)
@@ -871,11 +888,12 @@ def infer_feature_maps(
         "line_vec": vec_fields is not None,
         "elem_net": elem_maps is not None,
         "defect_net": defect_prob is not None,
+        "core_mode": bool(core_mode),
         "zoom_scale": eff_zoom,
         "vram_budget_mb": profile.vram_budget_mb,
         "sr_tile": profile.sr_tile,
     }
-    if sr_hi is not None and vec_fields is not None:
+    if not core_mode and sr_hi is not None and vec_fields is not None:
         sr_hi = _restore_tone_1x(sr_hi, rgb)
         sr_clean_1x = cv2.resize(sr_hi, (w, h), interpolation=cv2.INTER_AREA)
     return FeatureMaps(

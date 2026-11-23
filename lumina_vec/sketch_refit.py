@@ -9,7 +9,7 @@ from scipy.spatial import cKDTree
 from shapely import LineString, Polygon
 
 from .color import srgb_to_oklab
-from .contour import fit_cubic, _unit
+from .bezier_fit import fit_cubic, _unit
 from .geometry_guard import flatten
 from .structural_curves import line
 

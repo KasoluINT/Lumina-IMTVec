@@ -1,7 +1,7 @@
 """Fit geometric contours at source scale instead of following every grid step."""
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from .contour import fit_cubic, _unit, _fit_one, _chord_params
+from .bezier_fit import fit_cubic, _unit, _fit_one, _chord_params
 from scipy.spatial import cKDTree
 
 

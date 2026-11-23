@@ -33,7 +33,12 @@ def boundary_then_fill(svg, stroke_width=2, *, hidden_strokes=(), metadata=None,
         if color in hidden_strokes:
             edge.set('stroke-opacity', '0')
         root.remove(path)
-        if lines is not None and index in line_set:
+        pid = path.get('id', '')
+        try:
+            reg_id = int(pid.rsplit('-', 1)[1]) if pid.startswith('region-') else index
+        except ValueError:
+            reg_id = index
+        if lines is not None and reg_id in line_set:
             outlines_line.append(edge)
             lines.append(path)
         else:

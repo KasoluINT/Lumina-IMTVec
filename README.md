@@ -7,10 +7,10 @@
 
 ## 一、 原项目致谢（Acknowledgements）
 
-本项目最初参考并基于开源项目 **Lumina-Vec**（`0.9.2` 候选版）的工程骨架进行深度二次开发。  
-在演进过程中，**Lumina-IMTVec** 的核心算法、神经网络路由与矢量分割管线已经历了全面推倒与重构（包括多模型 ONNX 协同体系、`LineVectorNet` / `ElementGradNet` / `DefectRepairNet`、无损平面闭合轮廓分割管线 `planar_partition`、保护区解锁合并及大尺寸分块防爆内存机制等），在转换理念、结构形态与代码主体上与原项目已产生根本性差异；但 **Web 前端交互界面框架**（`webui.py`、`index.html` 的轻量化本地异步任务流与双图对比预览机制）以及 **后端部分共享边界建图与曲线拟合思路**（`shared_regions`、`structural_curves` 与几何防自交约束）借鉴并延续了 **Lumina-Vec** 的优秀工程设计。
+本项目基于开源项目 **[Lumina-Vec](https://github.com/MESFET5198/Lumina-Vec)**（`Copyright 2026 MESFET5198`，**Apache License 2.0**，`0.9.2` 候选版）进行二次开发。  
+在演进过程中，**Lumina-IMTVec** 的**核心矢量化管线与多模型 CNN 引擎已全面重写**（包括纯 ONNX 多模型协同体系 `LineVectorNet` / `ElementGradNet` / `DefectRepairNet`、无损平面闭合轮廓分割管线 `planar_partition`、RGBA 透明底无损保留、独立三次贝塞尔拟合 `bezier_fit`、可选轻量 AI 平涂预处理及显存自适应守护 `vram_guard`）；**Web 前端交互框架**（`webui.py`、`index.html` 的轻量化本地异步任务流与双图对比预览机制）、**部分基础色彩工具**（`lumina_vec/color.py`）与 **Windows 启动脚本**保留并演化自上游，并完整保留了上游 [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) 与 [NOTICE](NOTICE) 授权声明。
 
-在此向原项目 **Lumina-Vec** 及其作者致以由衷的感谢！
+在此向原项目 **Lumina-Vec** 及其作者 **MESFET5198** 致以由衷的感谢！
 
 ---
 
@@ -156,24 +156,42 @@ python -m lumina_vec.pipeline ink.png ink.svg --structure print-regions --no-ai
 Lumina-IMTVec\
 ├─ webui.py, index.html               WebUI 服务与前端交互界面（Flask + Waitress + 独立 Worker 子进程）
 ├─ pyproject.toml                     Python 工程与打包元数据（lumina-imtvec 1.0.0）
-├─ requirements-native.txt            纯 ONNX 原生运行依赖清单（零 PyTorch）
+├─ requirements-native.txt            纯 ONNX 原生运行依赖清单（零 PyTorch、零 vtracer）
+├─ LICENSE                            MIT 许可（Lumina-IMTVec 原创模块）与上游 Apache-2.0 文件说明
+├─ LICENSE-APACHE-2.0                 Apache License 2.0 完整许可正文（上游 Lumina-Vec 派生文件）
+├─ NOTICE                             上游 Lumina-Vec（Copyright 2026 MESFET5198）完整 NOTICE 与派生改动说明
+├─ THIRD_PARTY_LICENSES.md            第三方模型权重与依赖完整授权声明（含 Real-ESRGAN BSD-3-Clause）
 ├─ README.md                          项目说明、效果展示与部署指南
 ├─ ARCHITECTURE_SPEC.md               核心架构规范与回归基准永久留档
 ├─ CHANGELOG.md                       版本演进日志
-├─ lumina_vec\                        核心图像处理与矢量引擎包
-│   ├─ planar_partition.py            无损平面双层分区主引擎（Stage 2 -> 2.5 -> 3 -> 4）
-│   ├─ print_partition.py             vectorize_print 主入口与 SVG 矢量追踪集成
+├─ lumina_vec\                        核心图像处理与矢量引擎包（19 个精简核心模块，零死代码）
+│   ├─ planar_partition.py            无损平面双层分区主引擎（Stage 2 -> 2.5 -> 3 -> 4 + 透明通道隔离）
+│   ├─ print_partition.py             vectorize_print 主入口、RGBA 透明边缘色彩外扩与 SVG 追踪集成
 │   ├─ feature_routing.py             ONNX 多模型协同推理、40MP 分块混合防 OOM 与 OOM 回退机制
+│   ├─ ai_repaint.py                  可选轻量「AI 平涂重绘预处理」（OKLab 护线平涂，核心极简管线）
 │   ├─ vram_guard.py                  零 PyTorch 硬件探测与动态显存/内存自适应守护
-│   ├─ gradient_topology.py           梯度拓扑与单弧线腮红 MBO 平滑算法
-│   ├─ shared_regions.py              共享边界拓扑图构建与分段曲线追踪器（trace_regions）
+│   ├─ shared_regions.py              共享边界拓扑图构建与分段曲线追踪器（trace_regions，支持透明外轮廓平滑曲线）
+│   ├─ bezier_fit.py                  独立三次贝塞尔曲线与圆弧拟合模块
 │   ├─ structural_curves.py           共边结构曲线、转角平滑与圆弧/贝塞尔拟合
-│   ├─ boundary_corridor.py           SourceCorridor 原图边界定位与几何守护
+│   ├─ outline_stages.py              三阶段轮廓细化与节点平滑
+│   ├─ sketch_refit.py                手绘弧线二次平滑重拟合
+│   ├─ boundary_corridor.py           SourceCorridor 原图亚像素边界定位
+│   ├─ geometry_guard.py              基于 Shapely 的无自交拓扑几何守护
+│   ├─ tone_boundary.py               色调色界提取工具
+│   ├─ color.py                       OKLab 色彩空间与色差计算工具
 │   ├─ svg_layers.py                  双层/三层结构封装（#region-boundaries / #line-art-layer / #region-colours）
-│   ├─ two_layer_engine.py            repair_line_heatmap 共线脊线补断与旧双图层引擎
 │   ├─ pipeline.py / presets.py       CLI 入口与预设路由
-│   └─ worker.py                      WebUI 独立转换子进程入口（免服务重启即时热生效）
+│   └─ worker.py                      WebUI 独立转换子进程入口（支持 RGBA 透明预览输出）
 ├─ weights\                           内置纯 ONNX 推理权重（realesr_anime / line_vector_net / line_net / element_grad / feature_part / surface_style / defect_repair_net）
 ├─ scripts\                           Windows 纯 ONNX 一键部署与启动工具
 └─ docs\                              效果对比图（docs/images/）与设计分析文档
 ```
+
+---
+
+## 八、 许可与第三方授权声明
+
+- 本项目原创核心模块采用 **MIT License**，详见 [LICENSE](LICENSE)。
+- 源自上游 [Lumina-Vec](https://github.com/MESFET5198/Lumina-Vec)（`Copyright 2026 MESFET5198`）并经修改保留的文件（`webui.py`、`index.html`、`lumina_vec/color.py`、`lumina_vec/pipeline.py`、`lumina_vec/presets.py`、`scripts/setup_windows.ps1`、`scripts/start_web.bat`）继续遵循 **Apache License 2.0**，完整许可正文见 [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0)，上游要求保留的版权与归属声明见 [NOTICE](NOTICE)，且每个修改文件头部均已标注改动说明。
+- 内置模型权重（含 [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) `realesr-animevideov3` 转换而来的 `weights/realesr_anime.onnx`，**BSD-3-Clause**）、可选外部组件与 Python 依赖授权清单，详见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
+- 文档 `docs/images/` 中展示用的插画版权归原作者所有，仅作矢量化效果对比用途。

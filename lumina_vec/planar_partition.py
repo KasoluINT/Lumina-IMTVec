@@ -6,6 +6,8 @@ Implements the strict Stage 2 -> Stage 2.5 (5% buffer dual-edge & line closure) 
 """
 from __future__ import annotations
 
+from collections import deque
+
 import cv2
 import numpy as np
 from scipy.ndimage import distance_transform_edt, find_objects
@@ -15,7 +17,225 @@ from skimage.segmentation import watershed
 
 from .color import srgb_to_oklab
 from .outline_stages import snap_gray
-from .two_layer_engine import repair_line_heatmap
+
+
+def _trace_skel_tangent(skel: np.ndarray, sy: int, sx: int, max_steps: int = 8) -> tuple[float, float] | None:
+    """Walk backward along a 1-px skeleton branch from endpoint (sy, sx) to estimate outward unit tangent."""
+    h, w = skel.shape
+    curr = (sy, sx)
+    prev = None
+    path = [curr]
+    for _ in range(max_steps):
+        cy, cx = curr
+        nbrs = []
+        for dy in (-1, 0, 1):
+            ny = cy + dy
+            if ny < 0 or ny >= h:
+                continue
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                nx = cx + dx
+                if 0 <= nx < w and skel[ny, nx] and (ny, nx) != prev:
+                    nbrs.append((ny, nx))
+        if len(nbrs) != 1:
+            break
+        prev = curr
+        curr = nbrs[0]
+        path.append(curr)
+    if len(path) < 3:
+        return None
+    ty, tx = path[-1]
+    vy, vx = float(sy - ty), float(sx - tx)
+    norm = float(np.hypot(vy, vx))
+    if norm < 1e-4:
+        return None
+    return (vy / norm, vx / norm)
+
+
+def _bfs_near_skel(skel: np.ndarray, sy: int, sx: int, max_depth: int = 22) -> set[tuple[int, int]]:
+    """Return skeleton pixels reachable within `max_depth` steps along `skel` to avoid corner short-circuits."""
+    h, w = skel.shape
+    visited = {(sy, sx): 0}
+    q = deque([(sy, sx, 0)])
+    while q:
+        cy, cx, d = q.popleft()
+        if d >= max_depth:
+            continue
+        nd = d + 1
+        for dy in (-1, 0, 1):
+            ny = cy + dy
+            if ny < 0 or ny >= h:
+                continue
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                nx = cx + dx
+                if 0 <= nx < w and skel[ny, nx] and (ny, nx) not in visited:
+                    visited[(ny, nx)] = nd
+                    q.append((ny, nx, nd))
+    return set(visited.keys())
+
+
+def repair_line_heatmap(
+    heat_raw: np.ndarray,
+    L_raw: np.ndarray,
+    exclude_mask: np.ndarray | None = None,
+    max_gap: int = 18,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Repair small colinear breaks along continuous CNN line heatmaps before thresholding."""
+    h, w = heat_raw.shape[:2]
+    repaired = heat_raw.astype(np.float32, copy=True)
+    bridged = np.zeros((h, w), bool)
+    excl = exclude_mask if exclude_mask is not None else np.zeros((h, w), bool)
+
+    strong = (repaired >= 0.44) & (~excl) & (L_raw < 0.75)
+    if not strong.any():
+        return repaired, bridged
+
+    skel = skeletonize(strong)
+    s_u8 = skel.astype(np.uint8)
+    nbr = cv2.filter2D(s_u8, -1, np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT) - s_u8
+    eps_mask = skel & (nbr == 1) & (~excl)
+    ep_ys, ep_xs = np.where(eps_mask)
+    if len(ep_ys) == 0:
+        return repaired, bridged
+
+    tangents: dict[tuple[int, int], tuple[float, float]] = {}
+    for ey, ex in zip(ep_ys.tolist(), ep_xs.tolist()):
+        t = _trace_skel_tangent(skel, ey, ex, max_steps=8)
+        if t is not None:
+            tangents[(ey, ex)] = t
+
+    repaired_pairs: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    for (ey, ex), (uy, ux) in tangents.items():
+        y0, y1 = max(0, ey - max_gap), min(h, ey + max_gap + 1)
+        x0, x1 = max(0, ex - max_gap), min(w, ex + max_gap + 1)
+        sub_sk = skel[y0:y1, x0:x1]
+        sy_arr, sx_arr = np.where(sub_sk)
+        if len(sy_arr) == 0:
+            continue
+        near_same = _bfs_near_skel(skel, ey, ex, max_depth=max_gap + 4)
+
+        best_cand = None
+        best_score = 1e9
+        for r_y, r_x in zip(sy_arr.tolist(), sx_arr.tolist()):
+            qy, qx = y0 + r_y, x0 + r_x
+            if (qy, qx) in near_same or excl[qy, qx]:
+                continue
+            dy, dx = float(qy - ey), float(qx - ex)
+            dist = float(np.hypot(dy, dx))
+            if dist < 2.0 or dist > float(max_gap):
+                continue
+            cos_a = (dy * uy + dx * ux) / dist
+            min_cos = 0.82 if dist <= 9.0 else 0.87
+            if cos_a < min_cos:
+                continue
+            if (qy, qx) in tangents:
+                uqy, uqx = tangents[(qy, qx)]
+                if -(uy * uqy + ux * uqx) < 0.45:
+                    continue
+                sc = dist * (1.0 - 0.34 * cos_a)
+            else:
+                if cos_a < 0.90:
+                    continue
+                sc = dist * (1.20 - 0.30 * cos_a)
+            if sc < best_score:
+                best_score = sc
+                best_cand = (qy, qx, dist)
+
+        if best_cand is None:
+            continue
+        qy, qx, dist = best_cand
+        pair_key = tuple(sorted(((ey, ex), (qy, qx))))
+        if pair_key in repaired_pairs:
+            continue
+
+        dy, dx = float(qy - ey), float(qx - ex)
+        ud_y, ud_x = dy / dist, dx / dist
+        ny_perp, nx_perp = -ud_x, ud_y
+        n_steps = max(5, int(np.ceil(dist * 1.35)))
+        path_pts: list[tuple[int, int]] = []
+        side_contrasts: list[float] = []
+        valid_path = True
+        crossed_orthogonal = False
+
+        for k in range(1, n_steps):
+            t_f = k / float(n_steps)
+            by, bx = ey + t_f * dy, ex + t_f * dx
+            best_pt = None
+            best_obj = -1e9
+            for off in (0.0, -1.0, 1.0):
+                py = int(np.clip(round(by + off * ny_perp), 0, h - 1))
+                px = int(np.clip(round(bx + off * nx_perp), 0, w - 1))
+                if excl[py, px] or L_raw[py, px] > 0.75:
+                    continue
+                obj = float(repaired[py, px]) - 1.5 * float(L_raw[py, px]) - 0.06 * abs(off)
+                if obj > best_obj:
+                    best_obj = obj
+                    best_pt = (py, px)
+            if best_pt is None:
+                valid_path = False
+                break
+
+            sy_p, sx_p = best_pt
+            if 0.14 <= t_f <= 0.86:
+                p1_y = int(np.clip(round(sy_p + 2.5 * ny_perp), 0, h - 1))
+                p1_x = int(np.clip(round(sx_p + 2.5 * nx_perp), 0, w - 1))
+                p2_y = int(np.clip(round(sy_p - 2.5 * ny_perp), 0, h - 1))
+                p2_x = int(np.clip(round(sx_p - 2.5 * nx_perp), 0, w - 1))
+                if (
+                    repaired[sy_p, sx_p] >= 0.40
+                    and repaired[p1_y, p1_x] >= 0.45
+                    and repaired[p2_y, p2_x] >= 0.45
+                ):
+                    crossed_orthogonal = True
+                    break
+                if skel[sy_p, sx_p] and (sy_p, sx_p) not in near_same:
+                    local_t = _trace_skel_tangent(skel, sy_p, sx_p, max_steps=5)
+                    if local_t is not None and abs(local_t[0] * ud_y + local_t[1] * ud_x) < 0.55:
+                        crossed_orthogonal = True
+                        break
+
+            path_pts.append(best_pt)
+            c1_y = int(np.clip(round(sy_p + 2.0 * ny_perp), 0, h - 1))
+            c1_x = int(np.clip(round(sx_p + 2.0 * nx_perp), 0, w - 1))
+            c2_y = int(np.clip(round(sy_p - 2.0 * ny_perp), 0, h - 1))
+            c2_x = int(np.clip(round(sx_p - 2.0 * nx_perp), 0, w - 1))
+            side_contrasts.append(float(max(L_raw[c1_y, c1_x], L_raw[c2_y, c2_x]) - L_raw[sy_p, sx_p]))
+
+        if not valid_path or crossed_orthogonal or not path_pts:
+            continue
+
+        p_ys = np.array([p[0] for p in path_pts], dtype=np.intp)
+        p_xs = np.array([p[1] for p in path_pts], dtype=np.intp)
+        mean_h = float(np.mean(repaired[p_ys, p_xs]))
+        min_h = float(np.min(repaired[p_ys, p_xs]))
+        sc_arr = np.asarray(side_contrasts, dtype=np.float32)
+        mean_sc = float(np.mean(sc_arr))
+        valley_frac = float(np.mean(sc_arr >= 0.015))
+        ok = (
+            (mean_h >= 0.16 and min_h >= 0.08 and (valley_frac >= 0.58 or mean_h >= 0.25))
+            or (dist <= 9.0 and mean_h >= 0.12 and min_h >= 0.06 and mean_sc >= 0.025 and valley_frac >= 0.65)
+        )
+        if not ok:
+            continue
+
+        boost_val = float(np.clip(0.5 * (heat_raw[ey, ex] + heat_raw[qy, qx]), 0.54, 0.88))
+        full_pts = [(ey, ex)] + path_pts + [(qy, qx)]
+        for (ay, ax), (by_p, bx_p) in zip(full_pts[:-1], full_pts[1:]):
+            for py, px in ((ay, ax), (by_p, bx_p)):
+                if repaired[py, px] < boost_val:
+                    repaired[py, px] = boost_val
+                bridged[py, px] = True
+            if abs(ay - by_p) == 1 and abs(ax - bx_p) == 1:
+                cy, cx = (ay, bx_p) if L_raw[ay, bx_p] <= L_raw[by_p, ax] else (by_p, ax)
+                if repaired[cy, cx] < boost_val:
+                    repaired[cy, cx] = boost_val
+                bridged[cy, cx] = True
+        repaired_pairs.add(pair_key)
+
+    return repaired, bridged
 
 
 def _union_find_merge(
@@ -514,8 +734,14 @@ def build_planar_partition(
     orig_shape: tuple[int, int],
     *,
     unlock_mode: str = "buffer_split",
+    core_mode: bool = False,
+    visible_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Run Stage 2 -> 2.5 -> 3 -> 4 planar Teacher-SVG compartment construction at `sr_hi` resolution.
+
+    When `core_mode=True` (clean AI-repainted artwork), skips bilateral smudging, Stage 2.5
+    ElementGrad buffer handling, and Stage 3 gradient color banding, keeping pure Line-CNN
+    contour skeletons + Watershed solid compartments + gray snap.
 
     Returns:
       - `regions`: int32 4-connected label map `(Hs, Ws)` (0..N-1)
@@ -527,7 +753,7 @@ def build_planar_partition(
     h1, w1 = orig_shape
     l_sc = Hs / float(max(1, h1))
 
-    den_hi = cv2.bilateralFilter(sr_hi, 5, 10, 1.5)
+    den_hi = sr_hi if core_mode else cv2.bilateralFilter(sr_hi, 5, 10, 1.5)
     lab_hi = srgb_to_oklab(den_hi).astype(np.float32)
 
     gx = np.zeros((Hs, Ws), np.float32)
@@ -636,33 +862,45 @@ def build_planar_partition(
 
     fill_labels = _union_find_merge(
         fill_labels, fill_lab, ~line_mask,
-        dE_always=0.008,
-        area_sm=int(16 * l_sc * l_sc), dE_sm=0.032,
-        area_tiny=int(4 * l_sc * l_sc), dE_tiny=0.065,
+        dE_always=0.014 if core_mode else 0.008,
+        area_sm=int((24 if core_mode else 16) * l_sc * l_sc),
+        dE_sm=0.040 if core_mode else 0.032,
+        area_tiny=int((6 if core_mode else 4) * l_sc * l_sc),
+        dE_tiny=0.075 if core_mode else 0.065,
         min_tiny_abs=4,
     )
     _, fill_labels = np.unique(fill_labels, return_inverse=True)
     fill_labels = fill_labels.reshape(Hs, Ws).astype(np.int32)
 
-    # --- Stage 2.5: Post-Line-CNN Buffer Handling / Direct Unlock ---
-    if unlock_mode != "direct_unlock":
-        fill_labels, unified_grad = _process_line_buffer_5(
-            fill_labels, lab_hi, grad_E, gc95_hi, lb5_hi, line_mask, l_sc
-        )
-        _, fill_labels = np.unique(fill_labels, return_inverse=True)
-        fill_labels = fill_labels.reshape(Hs, Ws).astype(np.int32)
-    n_macro = int(fill_labels.max())
+    if core_mode:
+        # Ink-Locked Flat input is already clean discrete flat color blocks; skip Stage 2.5 & Stage 3 gradient banding.
+        n_macro = int(fill_labels.max())
+        bands_added = 0
+    else:
+        # --- Stage 2.5: Post-Line-CNN Buffer Handling / Direct Unlock ---
+        if unlock_mode != "direct_unlock":
+            fill_labels, unified_grad = _process_line_buffer_5(
+                fill_labels, lab_hi, grad_E, gc95_hi, lb5_hi, line_mask, l_sc
+            )
+            _, fill_labels = np.unique(fill_labels, return_inverse=True)
+            fill_labels = fill_labels.reshape(Hs, Ws).astype(np.int32)
+        n_macro = int(fill_labels.max())
 
-    # --- Stage 3: Gradient Color Banding -> Smooth Gradient-Step Contours ---
-    fill_labels, bands_added = _band_gradients_and_blush(
-        fill_labels, lab_hi, den_hi, unified_grad, line_mask, l_sc
-    )
+        # --- Stage 3: Gradient Color Banding -> Smooth Gradient-Step Contours ---
+        fill_labels, bands_added = _band_gradients_and_blush(
+            fill_labels, lab_hi, den_hi, unified_grad, line_mask, l_sc
+        )
 
     # --- Stage 4: Merge Line Ribbons + Fill/Gradient Compartments -> Single Pure Color per Shape ---
     total_labels = fill_labels.copy()
     if n_line_ribbons > 0:
         base_line_id = int(total_labels.max()) + 1
         total_labels[line_mask] = base_line_id + (line_comp_map[line_mask] - 1)
+    if visible_mask is not None:
+        # Isolate transparent exterior strictly so exterior bleed pixels NEVER contaminate visible colors
+        trans_id = int(total_labels.max()) + 1
+        total_labels[~visible_mask] = trans_id
+        line_mask = line_mask & visible_mask
     _, total_labels = np.unique(total_labels, return_inverse=True)
     total_labels = total_labels.reshape(Hs, Ws).astype(np.int32)
     n_total = int(total_labels.max()) + 1
@@ -671,6 +909,8 @@ def build_planar_partition(
         line_mask, np.maximum(repaired_heat, 0.1), np.where(dt_fill >= 1.2, dt_fill, 0.2)
     ).astype(np.float32)
     weight_mask[line_mask & (repaired_heat >= 0.40)] *= 4.0
+    if visible_mask is not None:
+        weight_mask[~visible_mask] = 0.0
 
     w_sum = np.bincount(total_labels.ravel(), weights=weight_mask.ravel(), minlength=n_total)
     colors_rgb = np.zeros((n_total, 3), np.uint8)
@@ -680,11 +920,22 @@ def build_planar_partition(
 
     # Snap near-pure grays cleanly without shifting deep dark/navy backgrounds away from source tones
     base_rgb = colors_rgb[total_labels]
-    # Relabel strictly 4-connected compartments for valid planar boundary tracing
-    regions = sk_label(base_rgb.astype(np.int32) @ np.array([65536, 256, 1]) + 1, connectivity=1) - 1
-    colors = np.empty((regions.max() + 1, 3), np.uint8)
-    colors[regions.ravel()] = base_rgb.reshape(-1, 3)
-    colors = snap_gray(colors, False)
+    # Relabel strictly 4-connected visible compartments (transparent pixels become -1 exterior!)
+    packed = base_rgb.astype(np.int32) @ np.array([65536, 256, 1]) + 1
+    if visible_mask is not None:
+        packed = np.where(visible_mask, packed, 0)
+        regions = sk_label(packed, connectivity=1, background=0).astype(np.int32) - 1
+        n_vis = int(regions.max()) + 1
+        colors = np.zeros((max(0, n_vis), 3), np.uint8)
+        if n_vis > 0:
+            vis = regions >= 0
+            colors[regions[vis]] = base_rgb[vis]
+            colors = snap_gray(colors, False)
+    else:
+        regions = sk_label(packed, connectivity=1).astype(np.int32) - 1
+        colors = np.empty((regions.max() + 1, 3), np.uint8)
+        colors[regions.ravel()] = base_rgb.reshape(-1, 3)
+        colors = snap_gray(colors, False)
 
     stats = dict(
         n_line_ribbons=n_line_ribbons,

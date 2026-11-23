@@ -1,3 +1,7 @@
+# Copyright 2026 MESFET5198 (Lumina-Vec, Apache License 2.0)
+# Modified 2026 by KasoluINT (Lumina-IMTVec): switched to pure-ONNX multi-CNN worker,
+# removed legacy vtracer/presets/print_mm routes, added RGBA preview & AI repaint flags.
+# See LICENSE-APACHE-2.0 and NOTICE for full license and attribution notices.
 import io, json, os, re, subprocess, sys, threading, time, uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -5,11 +9,6 @@ from PIL import Image
 from flask import Flask, request, jsonify, send_file, abort
 from lumina_vec import __version__
 from lumina_vec.presets import PRESETS        # data only: keeps numpy / cv2 / torch out of startup
-
-try:                                          # native Windows usually has no libcairo; the PNG
-    import cairosvg                           # preview is a nicety, the SVG result is the product
-except Exception:                             # noqa: BLE001
-    cairosvg = None
 
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get('LVEC_DATA') or HERE / 'data')
@@ -91,47 +90,11 @@ def _queue_position(job):
     return waiting.index(job) if job in waiting else 0
 
 
-PREVIEW_MAX = 1600
-
-
-def _raster_preview(work, path, w, h):
-    """Preview without libcairo: scale the pipeline's own working raster down.
-
-    cairosvg is missing on most native Windows boxes, so no PNG used to be produced at all; the
-    web UI then fed the SVG straight to the browser, and a 30 MB / 500k-path SVG hangs Chromium's
-    GPU rasteriser (>120 s on this machine). The pipeline already returns that raster, so use it.
-    """
-    try:
-        if work is None:
-            return False
-        im = work.convert('RGB')
-        if max(w, h) > PREVIEW_MAX:
-            k = PREVIEW_MAX / max(w, h)
-            im = im.resize((max(1, round(w * k)), max(1, round(h * k))), Image.LANCZOS)
-        im.save(path, 'PNG')
-        return path.is_file()
-    except Exception:                        # noqa: BLE001 - preview must never fail a job
-        return False
-
-
-def _render_png(svg, path, w, h):
-    """Rasterise the preview. Optional: without libcairo (common on native Windows) the job
-    still succeeds, the UI just shows the SVG on its own."""
-    if cairosvg is None:
-        return False
-    try:
-        cairosvg.svg2png(bytestring=svg.encode(), write_to=str(path), output_width=w, output_height=h)
-        return path.is_file()
-    except Exception:                        # noqa: BLE001 - preview must never fail a job
-        return False
-
-
 def work(job, raw, preset, overrides, fine=False):
     """在**子进程**里跑转换。
 
-    描摹是一次很长的原生调用（vtracer 的 Rust + numpy/opencv 循环），会长时间持有 GIL。
-    以前在服务进程里直接跑，转换期间 /api/status 甚至 /healthz 都会超时，网页就一直停在
-    "排队中"直到转换结束。改成子进程后 web 服务全程有响应，进度也能正常刷新。
+    矢量场 CNN 与平面分割计算会长时间占用原生计算线程并持有 GIL。
+    改为独立子进程执行后，Web 服务全程保持低延迟响应，进度可实时刷新，且退出时自动完整回收显存。
     """
     src = UP / f'{job}.source'
     svgpath = OUT / f'{job}.svg'
@@ -204,13 +167,19 @@ THUMB_PX = 200
 
 
 def _thumb(job):
-    """Small JPEG for the history list (the full PNG previews are up to ~5 MB each)."""
+    """Small JPEG for the history list (composites RGBA previews onto a light neutral backdrop)."""
     src = OUT / f'{job}.png'; dst = OUT / f'{job}.thumb.jpg'
     if dst.is_file() or not src.is_file():
         return dst if dst.is_file() else None
     try:
         with Image.open(src) as im:
-            im = im.convert('RGB'); im.thumbnail((THUMB_PX, THUMB_PX), Image.LANCZOS)
+            if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+                rgba = im.convert('RGBA')
+                bg = Image.new('RGBA', rgba.size, (242, 242, 246, 255))
+                im = Image.alpha_composite(bg, rgba).convert('RGB')
+            else:
+                im = im.convert('RGB')
+            im.thumbnail((THUMB_PX, THUMB_PX), Image.LANCZOS)
             im.save(dst, 'JPEG', quality=82)
         return dst
     except OSError:
@@ -224,68 +193,35 @@ def index():
 
 @app.post('/api/process')
 def process():
-    up = request.files.get('image'); preset = request.form.get('preset', 'auto')
+    up = request.files.get('image')
+    preset = request.form.get('preset', 'print-regions').strip() or 'print-regions'
     if not up or not up.filename:
         return jsonify(error='请选择图片'), 400
-    if preset not in ('auto', *PRESETS):
+    if preset == 'auto':
+        preset = 'print-regions'
+    if preset not in PRESETS:
         return jsonify(error='预设无效'), 400
     overrides = {}
-    if preset == 'source-detail':
-        repair = request.form.get('hair_repair', '0')
-        if repair not in ('0', '1'):
-            return jsonify(error='发丝修复选项无效'), 400
-        overrides['hair_repair'] = repair == '1'
     bands = request.form.get('bands', '').strip()
     if bands:
         if not bands.isdigit() or not (8 <= int(bands) <= 256):
             return jsonify(error='颜色数需在 8–256 之间'), 400
         overrides['bands'] = int(bands)
-    pmm = request.form.get('print_mm', '').strip()
-    if pmm:
-        try:
-            pmm = float(pmm); lmm = float(request.form.get('line_mm', '0.42') or 0.42)
-        except ValueError:
-            return jsonify(error='打印尺寸或线宽格式不对'), 400
-        if not (20 <= pmm <= 2000) or not (0.1 <= lmm <= 2):
-            return jsonify(error='打印尺寸需在 20–2000 mm，线宽 0.1–2 mm'), 400
-        overrides.update(print_mm=pmm, line_mm=lmm)
-        if 'bands' not in overrides:
-            overrides['bands'] = 56
-    if request.form.get('lines', '').strip() == 'none':
-        overrides['lines'] = None
-    ink = request.form.get('ink', '').strip()
-    if ink in ('0', '1'):
-        overrides['ink'] = ink == '1'
     fine = request.form.get('fine', '').strip() == '1'
-    ls = request.form.get('line_style', '').strip()
-    if ls in ('lens', 'lens5', 'lens7', 'v3', 'contour'):
-        overrides['line_style'] = ls
-    thin = request.form.get('thin', '').strip()
-    if thin in ('0', '1'):
-        overrides['thin_thr'] = 0.015 if thin == '1' else 0.0
-    st = request.form.get('structure', '').strip()
     gradient_mode = request.form.get('gradient_mode', '').strip()
     if gradient_mode in ('layered', 'clean'):
         overrides['gradient_mode'] = gradient_mode
-    if st in ('regions', 'fidelity', 'structured', 'flat', 'lumina', 'print-regions'):
-        overrides['structure'] = st
-    effective_structure = overrides.get('structure', PRESETS.get(preset, {}).get('structure'))
-    if effective_structure == 'print-regions':
-        if request.form.get('redraw_source') in ('0', '1'):
-            overrides['redraw_source'] = request.form.get('redraw_source') == '1'
-        if request.form.get('smooth_lines') in ('0', '1'):
-            overrides['smooth_lines'] = request.form.get('smooth_lines') == '1'
-        if request.form.get('feature_routing') in ('0', '1'):
-            overrides['feature_routing'] = request.form.get('feature_routing') == '1'
-        sr_scale = request.form.get('sr_scale', '').strip()
-        if sr_scale in ('2', '5', '10', '2.0', '5.0', '10.0'):
-            overrides['sr_scale'] = float(sr_scale)
-    rs = request.form.get('region_smooth', '').strip()
-    if rs in ('0', '1'):
-        overrides['region_smooth'] = rs == '1'
-    tracer = request.form.get('tracer', '').strip()
-    if tracer in ('contour', 'vtracer'):
-        overrides['tracer'] = tracer
+    if request.form.get('redraw_source') in ('0', '1'):
+        overrides['redraw_source'] = request.form.get('redraw_source') == '1'
+    if request.form.get('smooth_lines') in ('0', '1'):
+        overrides['smooth_lines'] = request.form.get('smooth_lines') == '1'
+    if request.form.get('feature_routing') in ('0', '1'):
+        overrides['feature_routing'] = request.form.get('feature_routing') == '1'
+    if request.form.get('ai_repaint') in ('0', '1'):
+        overrides['ai_repaint'] = request.form.get('ai_repaint') == '1'
+    sr_scale = request.form.get('sr_scale', '').strip()
+    if sr_scale in ('2', '5', '10', '2.0', '5.0', '10.0'):
+        overrides['sr_scale'] = float(sr_scale)
     raw = up.read(); job = uuid.uuid4().hex
     (UP / f'{job}.source').write_bytes(raw)
     with lock:
@@ -330,7 +266,8 @@ def delete_job(job):
             return jsonify(error='任务还在进行，不能删除'), 409
         jobs.pop(job)
         _save()
-    for f in (UP / f'{job}.source', OUT / f'{job}.svg', OUT / f'{job}.png', OUT / f'{job}.thumb.jpg'):
+    for f in (UP / f'{job}.source', OUT / f'{job}.svg', OUT / f'{job}.png',
+              OUT / f'{job}.thumb.jpg', OUT / f'{job}.heatmap.png'):
         f.unlink(missing_ok=True)
     return jsonify(ok=True)
 
@@ -390,7 +327,12 @@ def file(name):
                 import numpy as np
                 from lumina_vec.feature_routing import render_vector_heatmap_png
                 with Image.open(src_p) as im:
-                    rgb_im = im.convert('RGB')
+                    if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+                        rgba = im.convert('RGBA')
+                        bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                        rgb_im = Image.alpha_composite(bg, rgba).convert('RGB')
+                    else:
+                        rgb_im = im.convert('RGB')
                     rgb_np = np.asarray(rgb_im)
                 render_vector_heatmap_png(rgb_np, path)
             except Exception:                # noqa: BLE001
@@ -432,14 +374,26 @@ def _cnn_status():
         dml = 'DmlExecutionProvider' in ort.get_available_providers()
     except Exception:                        # noqa: BLE001
         pass
-    return dict(cnn_ready=ready, vector_ready=vector_ready, defect_ready=defect_ready, cnn_weights=files, directml=dml)
+    try:
+        from lumina_vec.ai_repaint import ai_repaint_status
+        _, ai_repaint_ready = ai_repaint_status(wdir)
+    except Exception:                        # noqa: BLE001
+        ai_repaint_ready = False
+    return dict(
+        cnn_ready=ready,
+        vector_ready=vector_ready,
+        defect_ready=defect_ready,
+        ai_repaint_ready=ai_repaint_ready,
+        cnn_weights=files,
+        directml=dml,
+    )
 
 
 @app.get('/healthz')
 def health():
     cnn = _cnn_status()
     return jsonify(status='ok', version=__version__, weights=WEIGHTS.is_file() or cnn['cnn_ready'],
-                   pth_weights=WEIGHTS.is_file(), cuda=_cuda_name(), presets=['auto', *PRESETS], **cnn)
+                   pth_weights=WEIGHTS.is_file(), cuda=_cuda_name(), presets=[*PRESETS], **cnn)
 
 
 def _cuda_name():
