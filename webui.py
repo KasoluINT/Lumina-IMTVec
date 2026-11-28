@@ -191,6 +191,14 @@ def index():
     return INDEX.read_text(encoding='utf8')
 
 
+@app.get('/favicon.ico')
+def favicon():
+    ico = HERE / 'assets' / 'icon.ico'
+    if ico.is_file():
+        return send_file(ico, mimetype='image/x-icon')
+    abort(404)
+
+
 @app.post('/api/process')
 def process():
     up = request.files.get('image')
