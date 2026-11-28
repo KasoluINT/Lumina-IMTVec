@@ -97,7 +97,13 @@
 
 ## 六、 快速启动与部署（纯 ONNX，免安装 PyTorch / 免用户训练）
 
-本项目已将全部特征识别与超分模型固化为轻量化 ONNX 权重并随仓库内置（`weights/*.onnx`，总计仅约 **20.54 MB**）。**普通用户无需安装数 GB 的 PyTorch / CUDA Toolkit，也无需自行训练或额外下载模型权重。**
+本项目已将全部特征识别、语义分割与超分模型固化为轻量化 ONNX 权重并随仓库内置（`weights/*.onnx`，8 个模型总计约 **36.0 MB**）。**普通用户无需安装数 GB 的 PyTorch / CUDA Toolkit，也无需自行训练或额外下载模型权重。**
+
+### 0. Release 压缩包开箱即用（最简方式）
+
+在 GitHub Releases 下载 **`Lumina-IMTVec-v1.1.0.zip`** 解压后，直接双击根目录 **`start_webui.bat`**：
+- 首次运行会自动创建本地 `.venv` 并安装纯 ONNX DirectML 依赖；
+- 随后自动启动 WebUI 并打开 <http://127.0.0.1:8091>（内置全部 8 个 ONNX 模型，免下载）。
 
 ### 1. 环境初始化（Windows 推荐 DirectML 通用 GPU 加速）
 
@@ -138,14 +144,14 @@ scripts\start_web.bat --port 8091
 ### 4. 命令行调用（CLI）
 
 ```powershell
-# 主线推荐：面向叠色打印的平面双层矢量（CNN 特征路由 + 纯净色阶 + SVG 边界平滑）
+# 主线推荐：面向叠色打印的平面双层矢量（CNN 特征路由 + 可选智能色彩合并 + SVG 边界平滑）
 python -m lumina_vec.pipeline input.png output.svg --preset print-regions
 
-# 显式指定 5x 细节复检倍率（适合超精细发丝/密集饰品原画）
-python -m lumina_vec.pipeline input.png output.svg --structure print-regions --gradient-mode clean --smooth-lines --sr-scale 5
+# 关闭智能色彩合并，保留全量原始平面分区色彩
+python -m lumina_vec.pipeline input.png output.svg --preset print-regions --no-color-merge
 
-# 严格纯黑白线稿无损像素描摹
-python -m lumina_vec.pipeline ink.png ink.svg --structure print-regions --no-ai
+# 显式指定 5x 细节复检倍率（适合超精细发丝/密集饰品原画）
+python -m lumina_vec.pipeline input.png output.svg --preset print-regions --gradient-mode clean --sr-scale 5
 ```
 
 ---
@@ -154,8 +160,9 @@ python -m lumina_vec.pipeline ink.png ink.svg --structure print-regions --no-ai
 
 ```text
 Lumina-IMTVec\
+├─ start_webui.bat                      Windows 一键初始化并启动 WebUI（双击即用）
 ├─ webui.py, index.html               WebUI 服务与前端交互界面（Flask + Waitress + 独立 Worker 子进程）
-├─ pyproject.toml                     Python 工程与打包元数据（lumina-imtvec 1.0.0）
+├─ pyproject.toml                     Python 工程与打包元数据（lumina-imtvec 1.1.0）
 ├─ requirements-native.txt            纯 ONNX 原生运行依赖清单（零 PyTorch、零 vtracer）
 ├─ LICENSE                            MIT 许可（Lumina-IMTVec 原创模块）与上游 Apache-2.0 文件说明
 ├─ LICENSE-APACHE-2.0                 Apache License 2.0 完整许可正文（上游 Lumina-Vec 派生文件）
@@ -168,7 +175,7 @@ Lumina-IMTVec\
 │   ├─ planar_partition.py            无损平面双层分区主引擎（Stage 2 -> 2.5 -> 3 -> 4 + 透明通道隔离）
 │   ├─ print_partition.py             vectorize_print 主入口、RGBA 透明边缘色彩外扩与 SVG 追踪集成
 │   ├─ feature_routing.py             ONNX 多模型协同推理、40MP 分块混合防 OOM 与 OOM 回退机制
-│   ├─ ai_repaint.py                  可选轻量「AI 平涂重绘预处理」（OKLab 护线平涂，核心极简管线）
+│   ├─ semantic_parts.py              8 类纯 ONNX 神经语义分割（背景/头发/头饰/面部/五官/颈手/服饰/道具）与饰品珠链守护
 │   ├─ vram_guard.py                  零 PyTorch 硬件探测与动态显存/内存自适应守护
 │   ├─ shared_regions.py              共享边界拓扑图构建与分段曲线追踪器（trace_regions，支持透明外轮廓平滑曲线）
 │   ├─ bezier_fit.py                  独立三次贝塞尔曲线与圆弧拟合模块
@@ -182,7 +189,7 @@ Lumina-IMTVec\
 │   ├─ svg_layers.py                  双层/三层结构封装（#region-boundaries / #line-art-layer / #region-colours）
 │   ├─ pipeline.py / presets.py       CLI 入口与预设路由
 │   └─ worker.py                      WebUI 独立转换子进程入口（支持 RGBA 透明预览输出）
-├─ weights\                           内置纯 ONNX 推理权重（realesr_anime / line_vector_net / line_net / element_grad / feature_part / surface_style / defect_repair_net）
+├─ weights\                           内置纯 ONNX 推理权重（realesr_anime / anime_part_seg / line_vector_net / line_net / element_grad / feature_part / surface_style / defect_repair_net）
 ├─ scripts\                           Windows 纯 ONNX 一键部署与启动工具
 └─ docs\                              效果对比图（docs/images/）与设计分析文档
 ```

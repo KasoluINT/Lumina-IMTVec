@@ -217,8 +217,8 @@ def process():
         overrides['smooth_lines'] = request.form.get('smooth_lines') == '1'
     if request.form.get('feature_routing') in ('0', '1'):
         overrides['feature_routing'] = request.form.get('feature_routing') == '1'
-    if request.form.get('ai_repaint') in ('0', '1'):
-        overrides['ai_repaint'] = request.form.get('ai_repaint') == '1'
+    if request.form.get('color_merge') in ('0', '1'):
+        overrides['color_merge'] = request.form.get('color_merge') == '1'
     sr_scale = request.form.get('sr_scale', '').strip()
     if sr_scale in ('2', '5', '10', '2.0', '5.0', '10.0'):
         overrides['sr_scale'] = float(sr_scale)
@@ -363,7 +363,8 @@ def _cnn_status():
     wdir = HERE / 'weights'
     files = {n: (wdir / n).is_file() for n in (
         'surface_style.onnx', 'feature_part.onnx', 'defect_repair_net.onnx',
-        'line_net.onnx', 'line_vector_net.onnx', 'element_grad.onnx', 'realesr_anime.onnx'
+        'line_net.onnx', 'line_vector_net.onnx', 'element_grad.onnx', 'realesr_anime.onnx',
+        'anime_part_seg.onnx',
     )}
     ready = files['surface_style.onnx'] and files['feature_part.onnx']
     vector_ready = files['line_vector_net.onnx']
@@ -374,16 +375,10 @@ def _cnn_status():
         dml = 'DmlExecutionProvider' in ort.get_available_providers()
     except Exception:                        # noqa: BLE001
         pass
-    try:
-        from lumina_vec.ai_repaint import ai_repaint_status
-        _, ai_repaint_ready = ai_repaint_status(wdir)
-    except Exception:                        # noqa: BLE001
-        ai_repaint_ready = False
     return dict(
         cnn_ready=ready,
         vector_ready=vector_ready,
         defect_ready=defect_ready,
-        ai_repaint_ready=ai_repaint_ready,
         cnn_weights=files,
         directml=dml,
     )

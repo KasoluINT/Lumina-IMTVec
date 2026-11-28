@@ -155,13 +155,13 @@ header .health{margin-left:auto;font-size:12px;color:var(--muted);display:flex;a
         </label>
       </div>
       <div id="printRegionsOpts" style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
-        <label id="aiRepaintWrap" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;cursor:pointer">
-          <input type="checkbox" id="aiRepaint" style="margin-top:2px">
-          <span><b>AI 平涂重绘预处理（核心极简管线）</b><br><small style="color:var(--muted)">勾选：墨线锁边平涂大色块 + 精简核心矢量；不勾选：直接使用原版完整管线</small></span>
-        </label>
         <label id="featureRoutingWrap" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;cursor:pointer">
           <input type="checkbox" id="featureRouting" checked style="margin-top:2px">
-          <span><b>CNN 智能特征路由（默认开启）</b><br><small id="cnnHint" style="color:var(--muted)">自动识别表面风格、眼部/嘴部微细特征、发丝与噪点并优化去杂与色块合并</small></span>
+          <span><b>CNN 智能特征路由（默认开启）</b><br><small id="cnnHint" style="color:var(--muted)">自动分割头发、面部五官、花朵发饰与渐变域，按主体分别约束色块并保护细节</small></span>
+        </label>
+        <label id="colorMergeWrap" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;cursor:pointer">
+          <input type="checkbox" id="colorMerge" checked style="margin-top:2px">
+          <span><b>智能色彩合并与去毛边（可选）</b><br><small style="color:var(--muted)">按语义主体面积/线长比例自动合并近色色块、均色融合细发丝并清理边缘毛边；关闭则保留全量原始分区色彩</small></span>
         </label>
         <label id="smoothLinesWrap" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;cursor:pointer">
           <input type="checkbox" id="smoothLines" checked style="margin-top:2px">
@@ -276,9 +276,9 @@ $('#go').onclick = () => {
   fd.append('preset', preset);
   for (const [key, value] of Object.entries(MODE_OPTIONS[preset])) fd.append(key, value);
   if (preset === 'print-regions') {
-    fd.append('ai_repaint', $('#aiRepaint').checked ? '1' : '0');
     fd.append('smooth_lines', $('#smoothLines').checked ? '1' : '0');
     fd.append('feature_routing', $('#featureRouting').checked ? '1' : '0');
+    fd.append('color_merge', $('#colorMerge').checked ? '1' : '0');
     fd.append('sr_scale', $('#srScale').value || '2');
   }
   $('#go').disabled = true; showErr(''); $('#result').classList.remove('show');
@@ -383,7 +383,12 @@ function showResult(id, r, forceSvg, layer = '') {
     stats.splice(5, 0, ['线稿路径', r.line_paths.toLocaleString()], ['着色分区', r.fill_paths.toLocaleString()]);
   }
   if (p.ink && p.bands) stats.splice(4, 0, ['线条', p.lines === null ? '颜色规则' : (p.print_mm || p.line_style === 'contour' ? 'AI（旧）' : p.line_style === 'lens7' ? '发丝连续（实验）' : p.line_style === 'lens' ? 'AI 双曲线' : 'AI v3')]);
-  if (p.structure === 'print-regions') stats.splice(2, 0, ['CNN 路由', p.feature_routing !== false ? (r.vector_field ? 'LineVectorNet 矢量场' : 'ONNX 热力路由') : '已关闭']);
+  if (p.structure === 'print-regions') {
+    stats.splice(2, 0,
+      ['CNN 路由', p.feature_routing !== false ? (r.vector_field ? 'LineVectorNet 矢量场' : 'ONNX 热力路由') : '已关闭'],
+      ['色彩合并', p.color_merge !== false ? '已开启' : '已关闭'],
+    );
+  }
   if (p.structure) stats.splice(1, 0, ['结构', STRUCTURE_LABELS[p.structure] || p.structure]);
   if (p.hair_repair) stats.splice(2, 0, ['重建细线', (r.repaired_hairs ?? 0) + ' 条']);
   if (p.fine) stats.splice(1, 0, ['模式', '精细']);
@@ -505,15 +510,10 @@ function esc(t) { return t.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 fetch('/healthz').then(r => r.json()).then(h => {
   $('#hdot').className = 'dot ' + (h.weights ? 'ok' : 'bad');
   if (h.cnn_ready) {
-    $('#htext').textContent = '服务正常 · ' + (h.vector_ready ? 'LineVectorNet 矢量场已加载' : 'CNN 已加载') + (h.ai_repaint_ready ? ' · 支持平涂重绘' : '') + (h.directml ? ' (DirectML)' : ' (CPU)');
-    if (!h.ai_repaint_ready && $('#aiRepaint')) {
-      $('#aiRepaint').checked = false;
-      $('#aiRepaint').disabled = true;
-    }
+    $('#htext').textContent = '服务正常 · ' + (h.vector_ready ? 'LineVectorNet 矢量场已加载' : 'CNN 已加载') + (h.directml ? ' (DirectML)' : ' (CPU)');
   } else {
     $('#htext').textContent = h.weights ? '服务正常（未检测到 CNN ONNX 权重）' : '缺少模型权重';
     if ($('#cnnHint')) $('#cnnHint').textContent = '未检测到 weights/*.onnx，将自动回退至传统规则路由';
-    if ($('#aiRepaint')) { $('#aiRepaint').checked = false; $('#aiRepaint').disabled = true; }
   }
   if (h.version) $('#ver').textContent = 'v' + h.version;
 }).catch(() => { $('#hdot').className = 'dot bad'; $('#htext').textContent = '服务不可用'; });

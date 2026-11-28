@@ -10,7 +10,7 @@ PRESETS = {
         gradient_mode="clean",
         smooth_lines=True,
         feature_routing=True,
-        ai_repaint=False,
+        color_merge=True,
     ),
 }
 

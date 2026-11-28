@@ -696,7 +696,28 @@ def _band_gradients_and_blush(
         if p_span < 0.013:
             continue
 
-        n_bands = int(np.clip(np.round(p_span / 0.022) + 1, 3, 10))
+        # RLRF perceptual error-budget band selection: pick the minimum band count `k` whose
+        # 90th-percentile OKLab quantization error drops below the perceptual budget (tighter on
+        # pale skin/blush, compact on background/cloth washes), eliminating redundant slivers.
+        mean_l = float(mean_v[0])
+        mean_c = float(np.hypot(mean_v[1], mean_v[2]))
+        is_skin_grad = (mean_l > 0.68) and (mean_c < 0.12) and (float(mean_v[1]) > 0.005)
+        err_budget = 0.012 if is_skin_grad else 0.019
+        if (not is_skin_grad) and float(np.percentile(np.abs(proj_in), 90)) <= 0.014:
+            continue
+
+        t_in = np.clip((proj_in - p_lo) / p_span, 0.0, 0.9999)
+        n_bands = 8
+        for k_try in range(2, 9):
+            b_idx = np.floor(t_in * k_try).astype(np.int32)
+            cnt_b = np.bincount(b_idx, minlength=k_try).astype(np.float64)
+            sum_b = np.bincount(b_idx, weights=proj_in, minlength=k_try)
+            mu_b = np.where(cnt_b > 0, sum_b / np.maximum(cnt_b, 1.0), 0.0)
+            p90_err = float(np.percentile(np.abs(proj_in - mu_b[b_idx]), 90))
+            if p90_err <= err_budget:
+                n_bands = k_try
+                break
+
         proj_all = (lab_sm - mean_v) @ axis1
         t_norm = np.clip((proj_all - p_lo) / p_span, 0.0, 0.9999)
         band_map = np.floor(t_norm * n_bands).astype(np.int32) + 1

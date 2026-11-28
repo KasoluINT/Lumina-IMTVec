@@ -3,7 +3,15 @@ from collections import defaultdict
 import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter1d, map_coordinates
-from .bezier_fit import fit_cubic, _unit, cubic_to_svg_arc
+from .bezier_fit import (
+    _unit,
+    cubic_to_svg_arc,
+    fit_arc_span,
+    fit_closed_circle_loop,
+    fit_closed_ellipse_loop,
+    fit_cubic,
+    fmt_coord,
+)
 
 
 def boundary_graph(labels):
@@ -185,7 +193,11 @@ def _compact_command(curve, tol_q=0.25, tol_a=0.35):
         if (0<=u<=w<=square
                 and abs(v[0]*(b-a)[1]-v[1]*(b-a)[0])<=1e-8
                 and abs(v[0]*(c-a)[1]-v[1]*(c-a)[0])<=1e-8):
-            return 'L%.3f,%.3f'%tuple(d)
+            if abs(d[1]-a[1])<=0.005:
+                return 'H'+fmt_coord(d[0])
+            if abs(d[0]-a[0])<=0.005:
+                return 'V'+fmt_coord(d[1])
+            return f'L{fmt_coord(d[0])},{fmt_coord(d[1])}'
     if tol_a>0 and square>4.0:
         arc=cubic_to_svg_arc(curve,tol=tol_a,n=9)
         if arc is not None:
@@ -194,8 +206,59 @@ def _compact_command(curve, tol_q=0.25, tol_a=0.35):
     # (sqrt(3)/36) * ||d - 3c + 3b - a||.
     if np.linalg.norm(d-3*c+3*b-a)*0.0481125<=tol_q:
         q=(3*b-a+3*c-d)*0.25
-        return 'Q%.3f,%.3f %.3f,%.3f'%(q[0],q[1],d[0],d[1])
-    return 'C%.3f,%.3f %.3f,%.3f %.3f,%.3f'%tuple(curve[1:].ravel())
+        return f'Q{fmt_coord(q[0])},{fmt_coord(q[1])} {fmt_coord(d[0])},{fmt_coord(d[1])}'
+    return (
+        f'C{fmt_coord(b[0])},{fmt_coord(b[1])} '
+        f'{fmt_coord(c[0])},{fmt_coord(c[1])} '
+        f'{fmt_coord(d[0])},{fmt_coord(d[1])}'
+    )
+
+
+def _compile_chain_commands(curves, tol_q=0.25, tol_a=0.35, compact_commands=True):
+    """Pre-compile a chain's cubic Béziers into canonical `(fwd_cmds, rev_cmds)` lists.
+
+    Supports greedy co-circular multi-cubic arc chaining (merging 2..4 consecutive co-circular
+    cubics into a single exact `A` arc) while guaranteeing bit-identical reversed traversal
+    for the opposite face (100% zero-gap shared edges).
+    """
+    fwd = []
+    rev_items = []
+    n = len(curves)
+    i = 0
+    merged_arcs = 0
+    while i < n:
+        if compact_commands and tol_a > 0.0 and (n - i) >= 2:
+            # Try merging 4, 3, or 2 consecutive cubics into one exact circular arc
+            best = None
+            for span in (4, 3, 2):
+                if i + span > n:
+                    continue
+                res = fit_arc_span(curves[i : i + span], tol=tol_a)
+                if res is not None:
+                    best = (span, res)
+                    break
+            if best is not None:
+                span, (r, la, sw, p0, p1) = best
+                rf = fmt_coord(r)
+                fwd.append(f"A{rf},{rf} 0 {la} {sw} {fmt_coord(p1[0])},{fmt_coord(p1[1])}")
+                rev_items.append(f"A{rf},{rf} 0 {la} {1 - sw} {fmt_coord(p0[0])},{fmt_coord(p0[1])}")
+                merged_arcs += span - 1
+                i += span
+                continue
+
+        s = curves[i]
+        if compact_commands:
+            fwd.append(_compact_command(s, tol_q=tol_q, tol_a=tol_a))
+            rev_items.append(_compact_command(s[::-1], tol_q=tol_q, tol_a=tol_a))
+        else:
+            b, c, d = s[1], s[2], s[3]
+            fwd.append(f"C{fmt_coord(b[0])},{fmt_coord(b[1])} {fmt_coord(c[0])},{fmt_coord(c[1])} {fmt_coord(d[0])},{fmt_coord(d[1])}")
+            sr = s[::-1]
+            rb, rc, rd = sr[1], sr[2], sr[3]
+            rev_items.append(f"C{fmt_coord(rb[0])},{fmt_coord(rb[1])} {fmt_coord(rc[0])},{fmt_coord(rc[1])} {fmt_coord(rd[0])},{fmt_coord(rd[1])}")
+        i += 1
+    rev_items.reverse()
+    return fwd, rev_items, merged_arcs
 
 
 def _is_canvas_frame(points, h, w):
@@ -257,12 +320,27 @@ def trace_regions(labels,colors,tol=.35,seam=0,rgb=None,placement='normal',geome
         i,d=ref;c=chains[i]
         if d==1: return c['vertices'][0],c['vertices'][-1],c['points'],c['curves']
         return c['vertices'][-1],c['vertices'][0],c['points'][::-1],[s[::-1] for s in c['curves'][::-1]]
-    paths=[];loops=0
+
+    sc_cmd = max(1.0, float(source_scale))
+    merged_arc_segs = 0
+    if not exact_grid:
+        for c in chains:
+            fwd_c, rev_c, m_cnt = _compile_chain_commands(
+                c['curves'],
+                tol_q=0.25 * sc_cmd,
+                tol_a=0.35 * sc_cmd,
+                compact_commands=compact_commands,
+            )
+            c['_cmds_fwd'] = fwd_c
+            c['_cmds_rev'] = rev_c
+            merged_arc_segs += m_cnt
+
+    paths=[];loops=0;circle_loops=0;ellipse_loops=0
     for face in sorted(faces):
         refs = faces[face]
         outgoing=defaultdict(list)
         for ref in refs: outgoing[oriented(ref)[0]].append(ref)
-        used=set();parts=[]
+        used=set();parts=[];face_loops=0;face_prim=None
         for initial in refs:
             if initial in used: continue
             start=oriented(initial)[0];ref=initial
@@ -288,25 +366,48 @@ def trace_regions(labels,colors,tol=.35,seam=0,rgb=None,placement='normal',geome
                 if end in positions:
                     k=positions[end];cycle=pending[k:]
                     pieces=[s for r in cycle for s in oriented(r)[3]]
-                    loops+=1
+                    loops+=1;face_loops+=1
                     if exact_grid:
                         parts.append('M%d,%d'%tuple(pieces[0][0]))
                         parts.extend('L%d,%d'%tuple(s[-1]) for s in pieces[:-1])
                     else:
-                        parts.append('M%.3f,%.3f'%tuple(pieces[0][0]))
-                        if compact_commands:
-                            sc=max(1.0,float(source_scale))
-                            parts.extend(_compact_command(s,tol_q=.25*sc,tol_a=.35*sc) for s in pieces)
+                        # StarVector-inspired exact circular / elliptical primitive compaction for
+                        # isolated single-chain closed loops (beads, eye catchlights, bokeh dots):
+                        # order-invariant Kasa / PCA fit emits identical 2-arc loop for both island
+                        # and enclosing parent hole (100% zero-gap planar water-tightness).
+                        circ = fit_closed_circle_loop(pieces, tol=0.38 * sc_cmd) if (compact_commands and len(cycle) == 1) else None
+                        if circ is not None:
+                            cx, cy, r, sw = circ
+                            rf = fmt_coord(r)
+                            x0, x1, yf = fmt_coord(cx - r), fmt_coord(cx + r), fmt_coord(cy)
+                            parts.append(f'M{x0},{yf}A{rf},{rf} 0 1 {sw} {x1},{yf}A{rf},{rf} 0 1 {sw} {x0},{yf}')
+                            circle_loops += 1
+                            face_prim = 'circle'
                         else:
-                            parts.extend('C%.3f,%.3f %.3f,%.3f %.3f,%.3f'%tuple(s[1:].ravel()) for s in pieces)
+                            ell = fit_closed_ellipse_loop(pieces, tol=0.42 * sc_cmd) if (compact_commands and len(cycle) == 1) else None
+                            if ell is not None:
+                                cx, cy, rx, ry, rot_deg, sw = ell
+                                rad = np.radians(rot_deg)
+                                dx_e, dy_e = rx * np.cos(rad), rx * np.sin(rad)
+                                x0, y0 = fmt_coord(cx - dx_e), fmt_coord(cy - dy_e)
+                                x1, y1 = fmt_coord(cx + dx_e), fmt_coord(cy + dy_e)
+                                rxf, ryf, rotf = fmt_coord(rx), fmt_coord(ry), fmt_coord(rot_deg)
+                                parts.append(f'M{x0},{y0}A{rxf},{ryf} {rotf} 0 {sw} {x1},{y1}A{rxf},{ryf} {rotf} 0 {sw} {x0},{y0}')
+                                ellipse_loops += 1
+                                face_prim = 'ellipse'
+                            else:
+                                parts.append(f'M{fmt_coord(pieces[0][0][0])},{fmt_coord(pieces[0][0][1])}')
+                                for ci, cd in cycle:
+                                    parts.extend(chains[ci]['_cmds_fwd'] if cd == 1 else chains[ci]['_cmds_rev'])
                     parts.append('Z');pending=pending[:k];vertices=vertices[:k+1]
                     positions={v:i for i,v in enumerate(vertices)}
                 else:positions[end]=len(vertices);vertices.append(end)
             assert not pending
         stroke=f' stroke="{colors[face]}" stroke-width="{seam}" stroke-linejoin="round" paint-order="stroke fill"' if seam else ''
-        paths.append(f'<path id="region-{face}" fill="{colors[face]}" fill-rule="evenodd"{stroke} d="{"".join(parts)}"/>')
+        prim_attr = f' data-primitive="{face_prim}"' if (face_prim and face_loops == 1) else ''
+        paths.append(f'<path id="region-{face}"{prim_attr} fill="{colors[face]}" fill-rule="evenodd"{stroke} d="{"".join(parts)}"/>')
     h,w=labels.shape
     svg=f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'+''.join(paths)+'</svg>'
-    stats=dict(regions=len(paths),loops=loops,shared_chains=sum(c['right']>=0 and c['left']>=0 for c in chains),chains=len(chains),atomic_edges=atomic_edges,curve_segments=sum(len(c['curves']) for c in chains))
+    stats=dict(regions=len(paths),loops=loops,circle_loops=circle_loops,ellipse_loops=ellipse_loops,merged_arc_segs=merged_arc_segs,shared_chains=sum(c['right']>=0 and c['left']>=0 for c in chains),chains=len(chains),atomic_edges=atomic_edges,curve_segments=sum(len(c['curves']) for c in chains))
     stats.update(guard_stats)
     return svg,stats

@@ -35,6 +35,7 @@ class FeatureMaps:
     defect_prob: np.ndarray | None = None     # float32 [Hs, Ws] pre-SVG DefectRepairNet probability map
     grad_core_95: np.ndarray | None = None    # bool [H, W] uniform 95%-volume shrunk closed gradient interior
     line_buffer_5: np.ndarray | None = None   # bool [H, W] uniform outer 5% ring reserved as line buffer zone
+    part_seg_probs: np.ndarray | None = None  # float32 [8, H, W] anime_part_seg.onnx semantic subject probabilities
 
 
 def release_session(path: Path | str) -> None:
@@ -653,6 +654,57 @@ def _suppress_dense_highlight_plateaus(
     return vf
 
 
+def _run_anime_part_seg_onnx(
+    sess,
+    rgb: np.ndarray,
+    sess_path: Path | None = None,
+) -> np.ndarray:
+    """Run static 512x512 aspect-preserving `anime_part_seg.onnx` with automatic 2nd-pass
+    character-ROI zoom for small-character full-scene illustrations -> float32 [8, H, W]."""
+    h, w = rgb.shape[:2]
+    size = 512
+    inp_name = sess.get_inputs()[0].name
+
+    def _infer_box(img_box: np.ndarray, cur_sess) -> tuple[np.ndarray, object]:
+        bh, bw = img_box.shape[:2]
+        sc = size / float(max(bh, bw))
+        nh = max(1, min(size, int(round(bh * sc))))
+        nw = max(1, min(size, int(round(bw * sc))))
+        interp = cv2.INTER_AREA if sc < 1.0 else cv2.INTER_LINEAR
+        r_im = cv2.resize(img_box, (nw, nh), interpolation=interp)
+        y0 = (size - nh) // 2
+        x0 = (size - nw) // 2
+        canvas = np.full((size, size, 3), 128, dtype=np.uint8)
+        canvas[y0:y0 + nh, x0:x0 + nw] = r_im
+        x = (canvas.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+        res, cur_sess = _safe_run(cur_sess, {inp_name: x}, sess_path=sess_path)
+        out = res[0][0]  # [8, 512, 512]
+        cropped = out[:, y0:y0 + nh, x0:x0 + nw]
+        probs_box = np.stack(
+            [cv2.resize(cropped[c], (bw, bh), interpolation=cv2.INTER_LINEAR) for c in range(8)],
+            axis=0,
+        )
+        return np.clip(probs_box, 0.0, 1.0).astype(np.float32), cur_sess
+
+    probs, sess = _infer_box(rgb, sess)
+    fg = probs[1:].max(axis=0) >= 0.40
+    fg_ratio = float(fg.mean())
+    if 0.01 <= fg_ratio <= 0.28:
+        ys, xs = np.where(fg)
+        cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+        cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+        bh, bw = cy1 - cy0, cx1 - cx0
+        pad_y = max(int(bh * 0.40), int(h * 0.10))
+        pad_x = max(int(bw * 0.40), int(w * 0.10))
+        ry0, ry1 = max(0, cy0 - pad_y), min(h, cy1 + pad_y)
+        rx0, rx1 = max(0, cx0 - pad_x), min(w, cx1 + pad_x)
+        if (ry1 - ry0) >= 96 and (rx1 - rx0) >= 96 and (ry1 - ry0) * (rx1 - rx0) < 0.72 * h * w:
+            p_roi, sess = _infer_box(rgb[ry0:ry1, rx0:rx1], sess)
+            probs[1:, ry0:ry1, rx0:rx1] = np.maximum(probs[1:, ry0:ry1, rx0:rx1], p_roi[1:])
+            probs[0] = np.clip(1.0 - probs[1:].max(axis=0), 0.0, 1.0)
+    return probs
+
+
 def infer_feature_maps(
     rgb: np.ndarray,
     weights_dir: str | Path | None = None,
@@ -674,6 +726,7 @@ def infer_feature_maps(
     p_elem = wdir / "element_grad.onnx"
     p_part = wdir / "feature_part.onnx"
     p_surf = wdir / "surface_style.onnx"
+    p_partseg = wdir / "anime_part_seg.onnx"
     if not any(p.is_file() for p in (p_line, p_vec, p_elem, p_part, p_surf)):
         return None
 
@@ -712,6 +765,15 @@ def infer_feature_maps(
         surf_pre = _run_surface_cnn(sess_surf, rgb, batch_size=profile.surface_batch, sess_path=p_surf) if sess_surf is not None else np.full((4, h, w), 0.25, np.float32)
         if profile.evict_per_stage and sess_surf is not None:
             release_session(f"{p_surf}|cpu={int(profile.force_cpu)}")
+
+    # 1B. Generalized 8-class neural semantic part segmentation (anime_part_seg.onnx, ~10-25ms)
+    part_seg_probs = None
+    if p_partseg.is_file():
+        sess_pseg = _get_session(p_partseg, **sess_kw)
+        if sess_pseg is not None:
+            part_seg_probs = _run_anime_part_seg_onnx(sess_pseg, rgb, sess_path=p_partseg)
+            if profile.evict_per_stage:
+                release_session(f"{p_partseg}|cpu={int(profile.force_cpu)}")
 
     # 2. Whole-image magnification (adaptive dynamic pixel & VRAM cap for low-end PCs)
     zoom_rgb = None
@@ -888,6 +950,7 @@ def infer_feature_maps(
         "line_vec": vec_fields is not None,
         "elem_net": elem_maps is not None,
         "defect_net": defect_prob is not None,
+        "part_seg_net": part_seg_probs is not None,
         "core_mode": bool(core_mode),
         "zoom_scale": eff_zoom,
         "vram_budget_mb": profile.vram_budget_mb,
@@ -912,6 +975,7 @@ def infer_feature_maps(
         defect_prob=defect_prob,
         grad_core_95=grad_core_95,
         line_buffer_5=line_buffer_5,
+        part_seg_probs=part_seg_probs,
     )
 
 

@@ -40,9 +40,8 @@ def vectorize(
     redraw_source: bool = False,
     smooth_lines: bool = True,
     feature_routing: bool = True,
+    color_merge: bool = True,
     sr_scale: float = 2.0,
-    ai_repaint: bool = False,
-    core_mode: bool | None = None,
     **kwargs,
 ):
     """Vectorize an image (RGB or RGBA with transparency) into a two-layer gapless SVG."""
@@ -55,9 +54,8 @@ def vectorize(
         redraw_source=redraw_source,
         smooth_lines=smooth_lines,
         feature_routing=feature_routing,
+        color_merge=color_merge,
         sr_scale=sr_scale,
-        ai_repaint=ai_repaint,
-        core_mode=core_mode,
     )
 
 
@@ -72,9 +70,9 @@ def main():
     ap.add_argument("--bands", type=int, default=None)
     ap.add_argument("--gradient-mode", default="clean", choices=["clean", "layered"])
     ap.add_argument("--sr-scale", type=float, default=2.0)
-    ap.add_argument("--ai-repaint", action="store_true", help="enable Ink-Locked Flat repaint + streamlined core mode")
     ap.add_argument("--no-smooth-lines", action="store_true")
     ap.add_argument("--no-feature-routing", action="store_true")
+    ap.add_argument("--no-color-merge", action="store_true", help="disable semantic proportional color merging & AA fringe cleanup")
     a = ap.parse_args()
 
     img = Image.open(a.input)
@@ -85,11 +83,12 @@ def main():
         params["bands"] = a.bands
     params["gradient_mode"] = a.gradient_mode
     params["sr_scale"] = a.sr_scale
-    params["ai_repaint"] = bool(a.ai_repaint)
     if a.no_smooth_lines:
         params["smooth_lines"] = False
     if a.no_feature_routing:
         params["feature_routing"] = False
+    if a.no_color_merge:
+        params["color_merge"] = False
 
     svg, _ = vectorize(img, **params)
     Path(a.output).write_text(svg, encoding="utf-8")
