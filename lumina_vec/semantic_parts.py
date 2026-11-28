@@ -217,11 +217,44 @@ def segment_semantic_parts(
         if hair_mask.any():
             hair_fill = hair_mask & (~is_line)
             if hair_fill.any():
-                hair_med = _weighted_median_oklab(labs[hair_fill], r_areas[hair_fill])
+                # Prefer high-confidence hair interior when estimating dominant hair color
+                hair_core = hair_fill & (r_probs[PART_HAIR] >= 0.60)
+                hair_ref = hair_core if hair_core.any() else hair_fill
+                hair_med = _weighted_median_oklab(labs[hair_ref], r_areas[hair_ref])
                 hair_c_med = float(np.hypot(hair_med[1], hair_med[2]))
                 de_from_hair = np.linalg.norm(labs - hair_med[None, :], axis=1)
+                de_ab_from_hair = np.linalg.norm(labs[:, 1:3] - hair_med[None, 1:3], axis=1)
                 reg_c = np.hypot(labs[:, 1], labs[:, 2])
                 reg_l = labs[:, 0]
+
+                # Boundary Closure 1: Hair Hue/Chroma Bleed Rejection ("边界收束闭合")
+                # When hair is distinctly colored (e.g. vivid blue/pink/green/brown hair), neutral
+                # dark eyeshadow/eyelashes/sclera or gray background patches splashed by the blurry
+                # neural hair fringe (`prob < 0.82`, `de_ab >= 0.09`, `chroma < 0.55 * hair_c_med`)
+                # are ejected from PART_HAIR so hair color can NEVER dye eyes or shaded face skin!
+                if hair_c_med >= 0.055:
+                    skin_eye_nb = _neighbor_frac(
+                        (part == PART_FACE_SKIN) | (part == PART_EYES_MOUTH) | (part == PART_NECK_HAND),
+                        e_src, e_dst, edge_w, total_border, n,
+                    )
+                    hair_bleed = (
+                        (part == PART_HAIR)
+                        & (r_probs[PART_HAIR] < 0.82)
+                        & (de_ab_from_hair >= 0.090)
+                        & (reg_c < hair_c_med * 0.55)
+                    )
+                    if hair_bleed.any():
+                        bleed_idx = np.flatnonzero(hair_bleed)
+                        for ri in bleed_idx.tolist():
+                            if skin_eye_nb[ri] >= 0.22:
+                                part[ri] = PART_EYES_MOUTH if (reg_l[ri] < 0.48 or r_delicate[ri] >= 0.20) else PART_FACE_SKIN
+                            else:
+                                # Runner-up non-hair class
+                                alt_p = r_probs[:, ri].copy()
+                                alt_p[PART_HAIR] = -1.0
+                                part[ri] = int(np.argmax(alt_p))
+                        hair_mask = part == PART_HAIR
+                        hair_fill = hair_mask & (~is_line)
 
                 # Distinct chromatic OR bright/dark jewel/pearl/flower embedded inside hair
                 # (excludes subtle hair sheen which stays close in chroma & lightness)
@@ -284,6 +317,59 @@ def segment_semantic_parts(
                 & ((r_delicate >= 0.22) | (r_probs[PART_EYES_MOUTH] >= 0.16))
             )
             part[embedded_face_detail] = PART_EYES_MOUTH
+
+        # ------------------------------------------------------------------
+        # Refinement C: Color-Guided Region-Graph Boundary Contraction ("边界收束")
+        # Snaps uncertain neural fringe regions (`prob < 0.66`) cleanly onto the
+        # neighboring semantic subject whose core color is >= 1.8x closer in
+        # chroma-weighted OKLab, locking semantic masks tightly to vector edges!
+        # ------------------------------------------------------------------
+        if len(e_src) > 0:
+            labs_w = labs.copy()
+            labs_w[:, 1] *= 2.2
+            labs_w[:, 2] *= 2.2
+            class_med_w = np.zeros((8, 3), dtype=np.float32)
+            class_has = np.zeros(8, dtype=bool)
+            for c in range(8):
+                mc = (part == c) & (~is_line) & (r_probs[c] >= 0.55)
+                if not mc.any():
+                    mc = (part == c) & (~is_line)
+                if mc.any():
+                    class_med_w[c] = _weighted_median_oklab(labs_w[mc], r_areas[mc])
+                    class_has[c] = True
+
+            for _ in range(2):
+                own_prob = r_probs[part, np.arange(n)]
+                uncertain = (own_prob < 0.66) & (part != PART_EYES_MOUTH) & (part != PART_HEADWEAR)
+                if not uncertain.any():
+                    break
+                u_ids = np.flatnonzero(uncertain)
+                starts = np.searchsorted(e_src, u_ids, side="left")
+                ends = np.searchsorted(e_src, u_ids, side="right")
+                nb_cls = part[e_dst]
+                changed = False
+                for ri, s_i, e_i in zip(u_ids.tolist(), starts.tolist(), ends.tolist()):
+                    if s_i >= e_i:
+                        continue
+                    cur_c = int(part[ri])
+                    if not class_has[cur_c]:
+                        continue
+                    d_own = float(np.linalg.norm(labs_w[ri] - class_med_w[cur_c]))
+                    if d_own <= 0.06:
+                        continue
+                    w_cls = np.bincount(nb_cls[s_i:e_i], weights=edge_w[s_i:e_i], minlength=8)
+                    w_cls[cur_c] = 0.0
+                    best_q = int(np.argmax(w_cls))
+                    if w_cls[best_q] / max(float(total_border[ri]), 1.0) < 0.42:
+                        continue
+                    if not class_has[best_q]:
+                        continue
+                    d_nb = float(np.linalg.norm(labs_w[ri] - class_med_w[best_q]))
+                    if d_nb < d_own * 0.55 and d_nb <= 0.14:
+                        part[ri] = best_q
+                        changed = True
+                if not changed:
+                    break
     else:
         # Lightweight fallback when anime_part_seg.onnx is absent (e.g. stripped unit tests)
         source = "feature_part_fallback"

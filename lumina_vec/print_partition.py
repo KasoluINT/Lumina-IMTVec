@@ -272,10 +272,20 @@ def merge_perceptual_regions(
         part_area_ratio[pid] = ratio_p
         part_k_max[pid] = max(k_min, int(round(k_full * ratio_p))) if a_p > 0.0 else 0
 
-    # Compact hair mass flag (<= 4.5% of total canvas, e.g. sakuragirl's 1.0% hair bun):
-    # receives full convergence to its tight area-ratio color quota & full interior clutter erasure!
-    # Large flowing hair (e.g. hutao11's 16.6% hair) keeps spaced hair-strand boundary lock!
-    is_compact_hair = 0.0 < part_area_ratio[PART_HAIR] <= 0.045
+    # Compact fragmented hair bun flag: requires BOTH small canvas share (<= 4.5%) AND genuine
+    # dense micro-fragmentation (e.g. sakuragirl's 14k-px dense bun), so large smooth painterly hair
+    # on 4K/13MP wallpapers (e.g. 158k-px blue hair at 1.2% share) is NEVER crushed into 6 colors!
+    hair_fill_m0 = (~is_line) & (part_ids == PART_HAIR)
+    if hair_fill_m0.any():
+        hair_area_1x_tot = float(r_area_1x[hair_fill_m0].sum())
+        hair_mean_fdens = float((r_frag_dens[hair_fill_m0] * r_areas[hair_fill_m0]).sum() / max(float(r_areas[hair_fill_m0].sum()), 1.0))
+    else:
+        hair_area_1x_tot = 0.0
+        hair_mean_fdens = 0.0
+    is_compact_hair = (
+        0.0 < part_area_ratio[PART_HAIR] <= 0.045
+        and (hair_mean_fdens >= 0.16 or hair_area_1x_tot <= 25000.0)
+    )
 
     # ------------------------------------------------------------------
     # Stage 2: Build Fill-Adjacency Graphs (Phase A: Direct, Phase B: Across-Thin-Line Voronoi)
@@ -654,7 +664,7 @@ def merge_perceptual_regions(
                 continue
 
             # Progressive near-color tiers: merge smallest-total-area near-color pairs first!
-            for tier_d in (0.045, 0.085, 0.140, 0.220):
+            for tier_d in (0.045, 0.080, 0.125, 0.175):
                 while len(active) > cc_k:
                     # Sort active groups ascending by CURRENT summed `grp_total_area`
                     active.sort(key=lambda r: float(grp_total_area[r]))
@@ -680,6 +690,9 @@ def merge_perceptual_regions(
                         if best_idx_b >= 0:
                             rb = active[best_idx_b]
                             win_rep, win_area = _pick_combined_winner(ra, rb)
+                            win_lw = labs_w[win_rep]
+                            if not (_drift_ok(ra, win_lw, tier_d * 1.15) and _drift_ok(rb, win_lw, tier_d * 1.15)):
+                                continue
                             keep_r = ra if len(grp_members[ra]) >= len(grp_members[rb]) else rb
                             drop_idx = best_idx_b if keep_r == ra else idx_a
                             _merge_two_groups(ra, rb, win_rep, win_area)

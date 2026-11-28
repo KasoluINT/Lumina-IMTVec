@@ -686,22 +686,48 @@ def _run_anime_part_seg_onnx(
         )
         return np.clip(probs_box, 0.0, 1.0).astype(np.float32), cur_sess
 
+    def _blend_roi(dst: np.ndarray, roi_probs: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> None:
+        """Smoothly replace blurry global probabilities inside a sharper zoomed ROI."""
+        wy = np.hanning(y1 - y0)[:, None].astype(np.float32)
+        wx = np.hanning(x1 - x0)[None, :].astype(np.float32)
+        wb = np.clip((wy * wx) * 5.0, 0.0, 1.0)
+        dst[:, y0:y1, x0:x1] = (1.0 - wb[None]) * dst[:, y0:y1, x0:x1] + wb[None] * roi_probs
+
     probs, sess = _infer_box(rgb, sess)
+
+    # Pass 2: Character foreground ROI zoom (feathered replacement erases blurry global bleed!)
     fg = probs[1:].max(axis=0) >= 0.40
     fg_ratio = float(fg.mean())
-    if 0.01 <= fg_ratio <= 0.28:
+    if 0.01 <= fg_ratio <= 0.35:
         ys, xs = np.where(fg)
         cy0, cy1 = int(ys.min()), int(ys.max()) + 1
         cx0, cx1 = int(xs.min()), int(xs.max()) + 1
         bh, bw = cy1 - cy0, cx1 - cx0
-        pad_y = max(int(bh * 0.40), int(h * 0.10))
-        pad_x = max(int(bw * 0.40), int(w * 0.10))
+        pad_y = max(int(bh * 0.35), int(h * 0.08))
+        pad_x = max(int(bw * 0.35), int(w * 0.08))
         ry0, ry1 = max(0, cy0 - pad_y), min(h, cy1 + pad_y)
         rx0, rx1 = max(0, cx0 - pad_x), min(w, cx1 + pad_x)
         if (ry1 - ry0) >= 96 and (rx1 - rx0) >= 96 and (ry1 - ry0) * (rx1 - rx0) < 0.72 * h * w:
             p_roi, sess = _infer_box(rgb[ry0:ry1, rx0:rx1], sess)
-            probs[1:, ry0:ry1, rx0:rx1] = np.maximum(probs[1:, ry0:ry1, rx0:rx1], p_roi[1:])
-            probs[0] = np.clip(1.0 - probs[1:].max(axis=0), 0.0, 1.0)
+            _blend_roi(probs, p_roi, ry0, ry1, rx0, rx1)
+
+    # Pass 3: Tight Head/Face ROI zoom (hair + headwear + face_skin + eyes_mouth)
+    # Resolves eyes, eyebrows, lips, and crisp hair/forehead edges even on wide 4K/13MP scenes!
+    head = probs[1:5].max(axis=0) >= 0.38
+    head_ratio = float(head.mean())
+    if 0.001 <= head_ratio <= 0.18:
+        ys, xs = np.where(head)
+        hy0, hy1 = int(ys.min()), int(ys.max()) + 1
+        hx0, hx1 = int(xs.min()), int(xs.max()) + 1
+        hh, hw = hy1 - hy0, hx1 - hx0
+        pad_y = max(int(hh * 0.45), 64)
+        pad_x = max(int(hw * 0.45), 64)
+        ry0, ry1 = max(0, hy0 - pad_y), min(h, hy1 + pad_y)
+        rx0, rx1 = max(0, hx0 - pad_x), min(w, hx1 + pad_x)
+        if (ry1 - ry0) >= 96 and (rx1 - rx0) >= 96 and (ry1 - ry0) * (rx1 - rx0) < 0.65 * h * w:
+            p_head, sess = _infer_box(rgb[ry0:ry1, rx0:rx1], sess)
+            _blend_roi(probs, p_head, ry0, ry1, rx0, rx1)
+
     return probs
 
 
